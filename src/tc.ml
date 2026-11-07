@@ -41,7 +41,7 @@ type ctx = {
   env : Env.t;
   bi : builtins;
   pos : int;                                   (* constants with pos < this are visible *)
-  local : (Name.t, cinfo) Hashtbl.t;           (* constants of the block being checked *)
+  local : cinfo Name.Tbl.t;           (* constants of the block being checked *)
   mutable lparams : Name.t list option;        (* universe parameters in scope *)
   safety : safety;
   infer_tbl : Expr.t Tbl.t;
@@ -56,20 +56,25 @@ type ctx = {
 
 let max_nat_bytes = 128 * 1024 * 1024
 
-let create ?(local = Hashtbl.create 8) ?(safety = Safe) env bi pos = {
+let create ?(local = Name.Tbl.create 8) ?(safety = Safe) env bi pos = {
   env; bi; pos; local; lparams = None; safety;
   infer_tbl = Tbl.create 1024; infer_only_tbl = Tbl.create 1024;
   whnf_core_tbl = Tbl.create 1024; whnf_tbl = Tbl.create 1024; unfold_tbl = Tbl.create 64;
   success = PTbl.create 256; failure = PTbl.create 256; eager = false;
 }
 
+let find_global c n =
+  match Name.Tbl.find c.env.consts n with
+  | ci when ci.pos >= 0 && ci.pos < c.pos -> Some ci
+  | _ -> None
+  | exception Not_found -> None
+
 let find c n =
-  match Hashtbl.find_opt c.local n with
+  if Name.Tbl.length c.local = 0 then find_global c n else
+  match Name.Tbl.find_opt c.local n with
   | Some _ as r -> r
   | None ->
-    match Hashtbl.find_opt c.env.consts n with
-    | Some ci when ci.pos >= 0 && ci.pos < c.pos -> Some ci
-    | _ -> None
+    find_global c n
 
 let get c n = match find c n with
   | Some ci -> ci
@@ -256,13 +261,13 @@ and infer_app c e infer_only =
       match !f_type with
       | Pi { b; _ } -> f_type := b
       | _ ->
-        let t = instantiate_gen !f_type (i - !j) (fun k -> args.(i - 1 - k)) in
+        let t = instantiate_args !f_type args !j i in
         (match ensure_pi c t with
          | Pi { b; _ } -> f_type := b
          | _ -> assert false);
         j := i
     done;
-    instantiate_gen !f_type (nargs - !j) (fun k -> args.(nargs - 1 - k))
+    instantiate_args !f_type args !j nargs
   end
 
 and infer_let c e infer_only =
@@ -381,7 +386,7 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
                | _ -> (f, m) in
              let body, m = strip f 0 in
              (* bvar k := args.(m - 1 - k) *)
-             let r = instantiate_gen body m (fun k -> args.(m - 1 - k)) in
+             let r = instantiate_args body args 0 m in
              whnf_core ~cheap_rec ~cheap_proj c (mk_app_sub r args m n)
            | _ when f == f0 ->
              (match reduce_recursor c e cheap_rec cheap_proj with
@@ -534,7 +539,7 @@ and unfold_definition_core c e =
     (match is_delta c e with
      | Some ci ->
        let v = match value ci with Some v -> v | None -> assert false in
-       if ls = [] then Some v
+       if (match ls with [] -> true | _ -> false) then Some v
        else (match Tbl.find c.unfold_tbl e with
            | r -> Some r
            | exception Not_found ->

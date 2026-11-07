@@ -10,6 +10,10 @@ let () =
   Arg.parse spec (fun f -> file := f) "ocaml4lean [-j N] [--stats] FILE.ndjson  (FILE may be - for stdin)";
   if !file = "" then (prerr_endline "no input file"; exit 2);
   let t0 = Unix.gettimeofday () in
+  (* Everything allocated while parsing stays live (it is the environment), so
+     major collections during parsing are pure overhead. *)
+  let gc0 = Gc.get () in
+  Gc.set { gc0 with space_overhead = 10_000 };
   let env =
     try
       let ic = if !file = "-" then stdin else open_in_bin !file in
@@ -19,7 +23,9 @@ let () =
     | Kernel.Parse.Bad m -> Printf.printf "parse error: %s\n" m; exit 2
     | Sys_error m -> Printf.printf "error: %s\n" m; exit 2 in
   let t1 = Unix.gettimeofday () in
-  let ndecls = Hashtbl.length env.consts in
+  Gc.set { gc0 with space_overhead = (match Sys.getenv_opt "O4L_SPACE_OVERHEAD" with Some v -> int_of_string v | None -> 120) };
+  if !stats then Printf.eprintf "expr table: %s\n%!" (Kernel.Expr.H.global_stats ());
+  let ndecls = Kernel.Name.Tbl.length env.consts in
   let on_error i m =
     if not !quiet then
       Printf.eprintf "error in block %d (%s): %s\n%!" i
@@ -29,7 +35,7 @@ let () =
   (* report axioms *)
   if not !quiet then begin
     let std = ["propext"; "Classical.choice"; "Quot.sound"] in
-    Hashtbl.iter (fun _ (ci : Kernel.Env.cinfo) ->
+    Kernel.Name.Tbl.iter (fun _ (ci : Kernel.Env.cinfo) ->
         match ci.kind with
         | Kernel.Env.Axiom ->
           let n = Kernel.Name.to_string ci.name in

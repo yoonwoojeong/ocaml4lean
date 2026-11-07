@@ -188,12 +188,12 @@ let check_block env bi pos (b : block) =
              body may refer to the declaration itself and its mutual group *)
           let c0 = Tc.create ~safety env bi pos in
           check_type c0 ci;
-          let local = Hashtbl.create 8 in
-          Hashtbl.replace local ci.name ci;
+          let local = Name.Tbl.create 8 in
+          Name.Tbl.replace local ci.name ci;
           List.iter (fun n ->
-              match Hashtbl.find_opt env.consts n with
+              match Name.Tbl.find_opt env.consts n with
               | Some ({ kind = Defn { safety = s; _ }; _ } as m) when s = safety && names_equal m.lparams ci.lparams ->
-                Hashtbl.replace local n m
+                Name.Tbl.replace local n m
               | _ -> ()) all;
           let c = Tc.create ~local ~safety env bi pos in
           check_value c ci value)
@@ -207,7 +207,7 @@ let check_block env bi pos (b : block) =
    arithmetic functions Nat.add, ... are trusted to be the standard ones.) *)
 let builtins (env : Env.t) =
   let open Expr in
-  let get n = Hashtbl.find_opt env.consts (Name.of_string n) in
+  let get n = Name.Tbl.find_opt env.consts (Name.of_string n) in
   let nat = const (Name.of_string "Nat") [] in
   let ind_ok n lps ty ctors = match get n with
     | Some { kind = Induct iv; ty = t; lparams; unsafe = false; _ } ->
@@ -247,17 +247,21 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
   let bi = builtins env in
   let nb = Array.length env.blocks in
   let errs = Array.make nb None in
+  let times = Array.make nb 0.0 in
+  let timing = Sys.getenv_opt "O4L_TIMES" <> None in
   let next = Atomic.make 0 in
   let worker () =
     let rec loop () =
       let i = Atomic.fetch_and_add next 1 in
       if i < nb then begin
+        let t0 = if timing then Unix.gettimeofday () else 0.0 in
         (try check_block env bi i env.blocks.(i) with
          | Kernel_error m -> errs.(i) <- Some m
          | Stack_overflow -> errs.(i) <- Some "stack overflow"
          | Out_of_memory -> errs.(i) <- Some "out of memory"
          | Not_found -> errs.(i) <- Some "internal error (Not_found)"
          | Invalid_argument m | Failure m -> errs.(i) <- Some ("internal error: " ^ m));
+        if timing then times.(i) <- Unix.gettimeofday () -. t0;
         (match errs.(i) with Some m -> on_error i m | None -> ());
         reset_scratch ();
         loop ()
@@ -268,6 +272,16 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
     let ds = List.init (jobs - 1) (fun _ -> Domain.spawn worker) in
     worker ();
     List.iter Domain.join ds
+  end;
+  if timing then begin
+    let idx = Array.init nb (fun i -> i) in
+    Array.sort (fun a b -> compare times.(b) times.(a)) idx;
+    let tot = Array.fold_left (+.) 0.0 times in
+    Printf.eprintf "total block time %.2fs; slowest:\n" tot;
+    for k = 0 to min 24 (nb - 1) do
+      let i = idx.(k) in
+      Printf.eprintf "  %7.3fs  %s\n" times.(i) (String.concat ", " (List.map Name.to_string (block_names env.blocks.(i))))
+    done
   end;
   let errors = ref [] in
   for i = nb - 1 downto 0 do match errs.(i) with Some m -> errors := (i, m) :: !errors | None -> () done;

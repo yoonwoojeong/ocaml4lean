@@ -5,18 +5,37 @@ module J = Json
 exception Bad of string
 let bad fmt = Printf.ksprintf (fun s -> raise (Bad s)) fmt
 
+(* index -> value tables: dense arrays, with a hash table for far-away indices *)
+module Idx = struct
+  type 'a t = { mutable arr : 'a option array; sparse : (int, 'a) Hashtbl.t }
+  let create n = { arr = Array.make n None; sparse = Hashtbl.create 16 }
+  let find t i =
+    if i >= 0 && i < Array.length t.arr then t.arr.(i) else Hashtbl.find_opt t.sparse i
+  let mem t i = find t i <> None
+  let set t i v =
+    if i < 0 then Hashtbl.replace t.sparse i v
+    else begin
+      if i >= Array.length t.arr && i < 4 * Array.length t.arr + 1_000_000 then begin
+        let na = Array.make (max (2 * Array.length t.arr) (i + 1)) None in
+        Array.blit t.arr 0 na 0 (Array.length t.arr); t.arr <- na
+      end;
+      if i < Array.length t.arr then t.arr.(i) <- Some v else Hashtbl.replace t.sparse i v
+    end
+end
+
 type st = {
-  names : (int, Name.t) Hashtbl.t;
-  levels : (int, Level.t) Hashtbl.t;
-  exprs : (int, Expr.t) Hashtbl.t;
-  consts : (Name.t, cinfo) Hashtbl.t;
+  names : Name.t Idx.t;
+  levels : Level.t Idx.t;
+  exprs : Expr.t Idx.t;
+  fl : Fastline.st;
+  consts : cinfo Name.Tbl.t;
   mutable blocks : block list;
   mutable nblocks : int;
   mutable dups : Name.t list;
   mutable pending_quot : cinfo list;   (* consecutive quot lines *)
 }
 
-let get tbl i what = match Hashtbl.find_opt tbl i with
+let get tbl i what = match Idx.find tbl i with
   | Some x -> x | None -> bad "undefined %s reference %d" what i
 
 let name st j = get st.names (J.to_int j) "name"
@@ -25,8 +44,8 @@ let expr st j = get st.exprs (J.to_int j) "expr"
 let names st j = List.map (name st) (J.to_list j)
 
 let def_unique tbl i v what =
-  if Hashtbl.mem tbl i then bad "duplicate %s index %d" what i;
-  Hashtbl.replace tbl i v
+  if Idx.mem tbl i then bad "duplicate %s index %d" what i;
+  Idx.set tbl i v
 
 let flush_quot st =
   match st.pending_quot with
@@ -43,8 +62,8 @@ let add_block st b =
   let pos = st.nblocks in
   let reg c =
     c.pos <- pos;
-    if Hashtbl.mem st.consts c.name then st.dups <- c.name :: st.dups
-    else Hashtbl.replace st.consts c.name c in
+    if Name.Tbl.mem st.consts c.name then st.dups <- c.name :: st.dups
+    else Name.Tbl.replace st.consts c.name c in
   (match b with
    | Single c -> reg c
    | QuotBlock l -> List.iter reg l
@@ -141,9 +160,9 @@ let line st (s : string) =
         | J.Str "type" -> QType | J.Str "ctor" -> QCtor | J.Str "lift" -> QLift | J.Str "ind" -> QInd
         | _ -> bad "bad quot kind" in
       let c = mk (name st (J.field "name" o)) (names st (J.field "levelParams" o)) (expr st (J.field "type" o)) (Quot k) false in
-      if Hashtbl.mem st.consts c.name || List.exists (fun d -> Name.equal d.name c.name) st.pending_quot
+      if Name.Tbl.mem st.consts c.name || List.exists (fun d -> Name.equal d.name c.name) st.pending_quot
       then st.dups <- c.name :: st.dups
-      else Hashtbl.replace st.consts c.name c;
+      else Name.Tbl.replace st.consts c.name c;
       st.pending_quot <- c :: st.pending_quot
     end else if has "inductive" then begin
       let o = f "inductive" in
@@ -172,18 +191,70 @@ let line st (s : string) =
     else bad "unknown line kind"
   | _ -> bad "line is not an object"
 
+(* fast path for name / level / expression lines *)
+let fast_line st (l : string) : bool =
+  let f = st.fl in
+  Fastline.scan f l && begin
+    let open Fastline in
+    let iv k = f.ints.(k) in
+    let has k = f.ints.(k) <> min_int in
+    let sv k = if f.slen.(k) < 0 then raise Exit else String.sub l f.sstart.(k) f.slen.(k) in
+    let nm k = get st.names (iv k) "name" and lv k = get st.levels (iv k) "level" and ex k = get st.exprs (iv k) "expr" in
+    try
+      if has k_ie then begin
+        let i = iv k_ie in
+        let e =
+          if has k_bvar then Expr.bvar (iv k_bvar)
+          else if has k_sort then Expr.sort (lv k_sort)
+          else if f.kind = k_app then Expr.app (ex k_fn) (ex k_arg)
+          else if f.kind = k_const then begin
+            if f.arr_key <> k_us then raise Exit;
+            let ls = List.init f.arr_n (fun j -> get st.levels f.arr.(j) "level") in
+            Expr.const (nm k_name) ls
+          end
+          else if f.kind = k_forall then Expr.pi (ex k_type) (ex k_body)
+          else if f.kind = k_lam then Expr.lam (ex k_type) (ex k_body)
+          else if f.kind = k_let then Expr.let_ (ex k_type) (ex k_value) (ex k_body)
+          else if f.kind = k_proj then
+            (if iv k_idx < 0 then raise Exit; Expr.proj (nm k_typename) (iv k_idx) (ex k_struct))
+          else if f.slen.(k_strval) >= 0 then raise Exit   (* may contain escapes: generic path *)
+          else if f.slen.(k_natval) >= 0 then Expr.natlit (Z.of_string (sv k_natval))
+          else raise Exit in
+        def_unique st.exprs i e "expr"; true
+      end else if has k_in then begin
+        let i = iv k_in in
+        let n =
+          if f.kind = k_str then Name.str (nm k_pre) (sv k_str)
+          else if f.kind = k_num then Name.num (nm k_pre) (iv k_i)
+          else raise Exit in
+        def_unique st.names i n "name"; true
+      end else if has k_il then begin
+        let i = iv k_il in
+        let l =
+          if has k_succ then Level.succ (lv k_succ)
+          else if has k_param then Level.param (nm k_param)
+          else if f.arr_n = 2 && f.arr_key = k_max then
+            Level.max_core (get st.levels f.arr.(0) "level") (get st.levels f.arr.(1) "level")
+          else if f.arr_n = 2 && f.arr_key = k_imax then
+            Level.imax_core (get st.levels f.arr.(0) "level") (get st.levels f.arr.(1) "level")
+          else raise Exit in
+        def_unique st.levels i l "level"; true
+      end else false
+    with Exit -> false
+  end
+
 let read_channel ic : Env.t =
-  let st = { names = Hashtbl.create 100_000; levels = Hashtbl.create 1000; exprs = Hashtbl.create 1_000_000;
-             consts = Hashtbl.create 100_000; blocks = []; nblocks = 0; dups = []; pending_quot = [] } in
-  Hashtbl.replace st.names 0 Name.Anon;
-  Hashtbl.replace st.levels 0 Level.zero;
+  let st = { names = Idx.create 100_000; levels = Idx.create 1000; exprs = Idx.create 1_000_000; fl = Fastline.create ();
+             consts = Name.Tbl.create 100_000; blocks = []; nblocks = 0; dups = []; pending_quot = [] } in
+  Idx.set st.names 0 Name.Anon;
+  Idx.set st.levels 0 Level.zero;
   let lineno = ref 0 in
   (try
      while true do
        let l = input_line ic in
        incr lineno;
        if String.length l > 0 then
-         (try line st l with
+         (try if not (fast_line st l) then line st l with
           | J.Error m -> bad "line %d: json error: %s" !lineno m
           | Bad m -> bad "line %d: %s" !lineno m
           | Failure m | Invalid_argument m -> bad "line %d: %s" !lineno m)

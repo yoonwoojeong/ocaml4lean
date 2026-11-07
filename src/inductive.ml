@@ -43,7 +43,7 @@ type gen = {
 (* -------------------------------------------------------------------------- *)
 (* add_inductive_fn                                                            *)
 (* -------------------------------------------------------------------------- *)
-let add_inductive_core env bi pos (overlay : (Name.t, cinfo) Hashtbl.t) (d : decl) (nnested : int) : gen =
+let add_inductive_core env bi pos (overlay : cinfo Name.Tbl.t) (d : decl) (nnested : int) : gen =
   let safety = if d.d_unsafe then Unsafe else Safe in
   (* a fresh checker whenever the overlay has grown, so caches are never stale *)
   let tc () = let c = Tc.create ~local:overlay ~safety env bi pos in c in
@@ -119,7 +119,7 @@ let add_inductive_core env bi pos (overlay : (Name.t, cinfo) Hashtbl.t) (d : dec
       let ci = { name = t.it_name; lparams = d.d_lparams; ty = t.it_ty; unsafe = d.d_unsafe; pos;
                  kind = Induct { nparams; nindices = nindices.(idx); all; ctors = List.map fst t.it_ctors;
                                  nnested; is_rec; is_reflexive } } in
-      Hashtbl.replace overlay t.it_name ci; ci) types) in
+      Name.Tbl.replace overlay t.it_name ci; ci) types) in
   refresh ();
   (* ---- check_constructors ---- *)
   let is_valid_ind_app t idx =
@@ -148,10 +148,10 @@ let add_inductive_core env bi pos (overlay : (Name.t, cinfo) Hashtbl.t) (d : dec
         if which_valid_ind_app t = None then
           fail "arg #%d of '%s' contains a non valid occurrence of the datatypes being declared" (arg_idx + 1) (Name.to_string cname) in
   Array.iteri (fun idx t ->
-      let seen = Hashtbl.create 8 in
+      let seen = Name.Tbl.create 8 in
       List.iter (fun (n, cty) ->
-          if Hashtbl.mem seen n then fail "duplicate constructor name '%s'" (Name.to_string n);
-          Hashtbl.add seen n ();
+          if Name.Tbl.mem seen n then fail "duplicate constructor name '%s'" (Name.to_string n);
+          Name.Tbl.add seen n ();
           ignore (check cty d.d_lparams);
           let t = ref cty and i = ref 0 in
           while is_pi !t do
@@ -179,7 +179,7 @@ let add_inductive_core env bi pos (overlay : (Name.t, cinfo) Hashtbl.t) (d : dec
           if ar < nparams then fail "constructor '%s' has too few arguments" (Name.to_string n);
           let ci = { name = n; lparams = d.d_lparams; ty = cty; unsafe = d.d_unsafe; pos;
                      kind = Ctor { induct = t.it_name; cidx; cnparams = nparams; nfields = ar - nparams } } in
-          Hashtbl.replace overlay n ci; ci) t.it_ctors) types)) in
+          Name.Tbl.replace overlay n ci; ci) t.it_ctors) types)) in
   refresh ();
   (* ---- init_elim_level ---- *)
   let elim_only_at_zero () =
@@ -315,7 +315,7 @@ let add_inductive_core env bi pos (overlay : (Name.t, cinfo) Hashtbl.t) (d : dec
       let ci = { name = rn; lparams = rec_lparams; ty = rec_ty; unsafe = d.d_unsafe; pos;
                  kind = Recursor { rall = all; rnparams = nparams; rnindices = nindices.(d_idx);
                                    nmotives = ntypes; nminors; rules; k = k_target } } in
-      Hashtbl.replace overlay rn ci; ci) types) in
+      Name.Tbl.replace overlay rn ci; ci) types) in
   refresh ();
   (* ---- check_recursors ---- *)
   List.iteri (fun d_idx rci ->
@@ -498,7 +498,7 @@ let add_inductive env bi pos (d : decl) : gen =
   let c0 = Tc.create env bi pos in
   let res = elim_nested c0 d in
   let nnested = List.length res.nr_aux2nested in
-  let aux_overlay = Hashtbl.create 64 in
+  let aux_overlay = Name.Tbl.create 64 in
   let aux = add_inductive_core env bi pos aux_overlay res.nr_decl nnested in
   if nnested = 0 then aux
   else begin
@@ -510,11 +510,11 @@ let add_inductive env bi pos (d : decl) : gen =
       List.mapi (fun i t -> (rec_name t.it_name, Name.append_index_after (rec_name main_name) (i + 1)))
         (List.filteri (fun i _ -> i >= ntypes) res.nr_decl.d_types) in
     let aux_types = List.filteri (fun i _ -> i >= ntypes) res.nr_decl.d_types in
-    let aux_ctor_owner = Hashtbl.create 16 in
-    List.iter (fun t -> List.iter (fun (cn, _) -> Hashtbl.replace aux_ctor_owner cn t.it_name) t.it_ctors) aux_types;
+    let aux_ctor_owner = Name.Tbl.create 16 in
+    List.iter (fun t -> List.iter (fun (cn, _) -> Name.Tbl.replace aux_ctor_owner cn t.it_name) t.it_ctors) aux_types;
     let np = Array.length res.nr_params in
     let restore_ctor_name cn =
-      match Hashtbl.find_opt aux_ctor_owner cn with
+      match Name.Tbl.find_opt aux_ctor_owner cn with
       | None -> fail "failed to restore nested inductive types"
       | Some auxi ->
         let nested = List.assoc auxi res.nr_aux2nested in
@@ -545,7 +545,7 @@ let add_inductive env bi pos (d : decl) : gen =
                let nt = instantiate_rev (abstract nested res.nr_params np) as_ in
                Some (mk_app_sub nt args np (Array.length args))
              | None ->
-               match Hashtbl.find_opt aux_ctor_owner n with
+               match Name.Tbl.find_opt aux_ctor_owner n with
                | Some auxi ->
                  let nested = List.assoc auxi res.nr_aux2nested in
                  let _, args = get_app_args t in
@@ -581,8 +581,8 @@ let add_inductive env bi pos (d : decl) : gen =
         | _ -> assert false) aux.g_recs in
     (* type check the nested occurrences and re-check the restored terms in the
        real (restored) environment *)
-    let overlay = Hashtbl.create 64 in
-    List.iter (fun ci -> Hashtbl.replace overlay ci.name ci) (g_types @ g_ctors @ g_recs);
+    let overlay = Name.Tbl.create 64 in
+    List.iter (fun ci -> Name.Tbl.replace overlay ci.name ci) (g_types @ g_ctors @ g_recs);
     let safety = if d.d_unsafe then Unsafe else Safe in
     let c = Tc.create ~local:overlay ~safety env bi pos in
     c.lparams <- Some d.d_lparams;

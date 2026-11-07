@@ -19,6 +19,7 @@ module H = Hc.Make (struct
       | Param x, Param y -> x.n == y.n
       | _ -> false
     let hash = hash
+    let dummy = Zero
   end)
 
 let zero = Zero

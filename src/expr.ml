@@ -4,7 +4,8 @@
    physically equal.
 
    [i] packs cached data:  bit 0 = has free variables,  bit 1 = has universe
-   parameters,  bits 2.. = loose bound variable range (1 + max loose index). *)
+   parameters,  bit 2 = node lives in the global hash-cons tier,
+   bits 3.. = loose bound variable range (1 + max loose index). *)
 
 type t =
   | BVar of { h : int; i : int; idx : int }
@@ -29,10 +30,11 @@ let info = function
   | Lam { i; _ } | Pi { i; _ } | Let { i; _ } | NatLit { i; _ } | StrLit { i; _ }
   | Proj { i; _ } -> i
 
-let lbr e = info e lsr 2
+let lbr e = info e lsr 3
 let has_fvar e = info e land 1 <> 0
 let has_lparam e = info e land 2 <> 0
-let closed e = info e < 4                      (* no loose bvars *)
+let is_global e = info e land 4 <> 0
+let closed e = info e < 8                      (* no loose bvars *)
 
 module H = Hc.Make (struct
     type nonrec t = t
@@ -55,28 +57,32 @@ module H = Hc.Make (struct
       | Proj x, Proj y -> x.s == y.s && x.idx = y.idx && x.e == y.e
       | _ -> false
     let hash = hash
+    let dummy = BVar { h = 0; i = 0; idx = 0 }
   end)
 
 let mix = Hc.mix
-let mk_info ~fv ~lp ~lbr = (lbr lsl 2) lor (if fv then 1 else 0) lor (if lp then 2 else 0)
-let union a b = (max (a lsr 2) (b lsr 2) lsl 2) lor ((a lor b) land 3)
+let gbit () = if !Hc.frozen then 0 else 4
+let mk_info ~fv ~lp ~lbr = (lbr lsl 3) lor (if fv then 1 else 0) lor (if lp then 2 else 0) lor gbit ()
+let union a b = (max (a lsr 3) (b lsr 3) lsl 3) lor ((a lor b) land 3) lor gbit ()
 (* info of a binder body: loose range decreases by one *)
-let under i = let r = i lsr 2 in ((if r > 0 then r - 1 else 0) lsl 2) lor (i land 3)
+let under i = let r = i lsr 3 in ((if r > 0 then r - 1 else 0) lsl 3) lor (i land 3)
+let g2 a b = info a land info b land 4 <> 0
+let g3 a b c = info a land info b land info c land 4 <> 0
 
-let bvar idx = H.intern (BVar { h = mix 101 idx; i = mk_info ~fv:false ~lp:false ~lbr:(idx + 1); idx })
-let sort l = H.intern (Sort { h = mix 103 (Level.hash l); i = mk_info ~fv:false ~lp:(Level.has_param l) ~lbr:0; l })
+let bvar idx = H.intern_g true (BVar { h = mix 101 idx; i = mk_info ~fv:false ~lp:false ~lbr:(idx + 1); idx })
+let sort l = H.intern_g true (Sort { h = mix 103 (Level.hash l); i = mk_info ~fv:false ~lp:(Level.has_param l) ~lbr:0; l })
 let const n ls =
   let h = List.fold_left (fun h l -> mix h (Level.hash l)) (mix 107 (Name.hash n)) ls in
-  H.intern (Const { h; i = mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0; n; ls })
-let app f a = H.intern (App { h = mix (mix 109 (hash f)) (hash a); i = union (info f) (info a); f; a })
-let lam ty b = H.intern (Lam { h = mix (mix 113 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
-let pi ty b = H.intern (Pi { h = mix (mix 127 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
+  H.intern_g true (Const { h; i = mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0; n; ls })
+let app f a = H.intern_g (g2 f a) (App { h = mix (mix 109 (hash f)) (hash a); i = union (info f) (info a); f; a })
+let lam ty b = H.intern_g (g2 ty b) (Lam { h = mix (mix 113 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
+let pi ty b = H.intern_g (g2 ty b) (Pi { h = mix (mix 127 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
 let let_ ty v b =
-  H.intern (Let { h = mix (mix (mix 131 (hash ty)) (hash v)) (hash b);
+  H.intern_g (g3 ty v b) (Let { h = mix (mix (mix 131 (hash ty)) (hash v)) (hash b);
                   i = union (union (info ty) (info v)) (under (info b)); ty; v; b })
-let natlit n = H.intern (NatLit { h = mix 137 (Z.hash n); i = 0; n })
-let strlit s = H.intern (StrLit { h = mix 139 (Hashtbl.hash s); i = 0; s })
-let proj s idx e = H.intern (Proj { h = mix (mix (mix 149 (Name.hash s)) idx) (hash e); i = info e; s; idx; e })
+let natlit n = H.intern_g true (NatLit { h = mix 137 (Z.hash n); i = gbit (); n })
+let strlit s = H.intern_g true (StrLit { h = mix 139 (Hashtbl.hash s); i = gbit (); s })
+let proj s idx e = H.intern_g (is_global e) (Proj { h = mix (mix (mix 149 (Name.hash s)) idx) (hash e); i = (info e land (lnot 4)) lor gbit (); s; idx; e })
 
 (* Free variables are never shared between domains: per-domain counter. *)
 let fv_counter = Domain.DLS.new_key (fun () -> ref 0)
@@ -116,6 +122,32 @@ module Tbl2 = Hashtbl.Make (struct
     let equal (a, i) (b, j) = a == b && i = j
     let hash (a, i) = mix (hash a) i
   end)
+
+(* Lossy, direct-mapped memo table keyed by (node, offset), one per domain and
+   traversal kind.  Entries are invalidated in O(1) by bumping a generation
+   counter, so starting a traversal allocates nothing.  Being lossy only costs
+   recomputation: results never depend on whether an entry is present. *)
+module Memo = struct
+  let bits = 14
+  let size = 1 lsl bits
+  type m = { ks : t array; offs : int array; gens : int array; vs : t array; mutable gen : int }
+  let dummy = BVar { h = 0; i = 0; idx = 0 }
+  let create () = { ks = Array.make size dummy; offs = Array.make size 0; gens = Array.make size 0;
+                    vs = Array.make size dummy; gen = 0 }
+  let start m = m.gen <- m.gen + 1
+  let slot e off = (mix (hash e) off) land (size - 1)
+  let find m e off =
+    let i = slot e off in
+    if Array.unsafe_get m.gens i = m.gen && Array.unsafe_get m.ks i == e && Array.unsafe_get m.offs i = off
+    then Array.unsafe_get m.vs i else raise Not_found
+  let add m e off v =
+    let i = slot e off in
+    Array.unsafe_set m.gens i m.gen; Array.unsafe_set m.ks i e;
+    Array.unsafe_set m.offs i off; Array.unsafe_set m.vs i v
+  (* Generations make the arrays retain dead nodes only up to [size] entries. *)
+  let key = Domain.DLS.new_key (fun () -> Array.init 6 (fun _ -> create ()))
+  let get k = let m = (Domain.DLS.get key).(k) in start m; m
+end
 
 (* lift loose bvars >= s by d *)
 let lift_loose e s d =
@@ -159,11 +191,13 @@ let lower_loose e s d =
     go e 0
   end
 
-(* instantiate e with subst: loose bvar (off + k) for k < n becomes [get k]
-   (lifted by off), bvar (off + k) for k >= n becomes bvar (off + k - n). *)
-let instantiate_gen e n (get : int -> t) =
+(* instantiate e with subst: loose bvar (off + k) for k < n becomes subst k
+   (lifted by off), bvar (off + k) for k >= n becomes bvar (off + k - n).
+   [subst k] = arr.(base - k) if [rev] else arr.(base + k). *)
+let instantiate_core e n (arr : t array) base rev =
   if closed e || n = 0 then e else begin
     let cache = Tbl2.create 32 in
+    let get k = if rev then Array.unsafe_get arr (base - k) else Array.unsafe_get arr (base + k) in
     let rec go e off =
       if lbr e <= off then e else
         match e with
@@ -185,27 +219,54 @@ let instantiate_gen e n (get : int -> t) =
     go e 0
   end
 
+let instantiate_gen e n (get : int -> t) = instantiate_core e n (Array.init n get) 0 false
+
 (* bvar 0 := v *)
-let instantiate1 e v = instantiate_gen e 1 (fun _ -> v)
+let instantiate1 e v =
+  if closed e then e else begin
+    let cache = Tbl2.create 32 in
+    let rec go e off =
+      if lbr e <= off then e else
+        match e with
+        | BVar { idx; _ } -> if idx = off then lift_loose v 0 off else bvar (idx - 1)
+        | _ ->
+          match Tbl2.find cache (e, off) with
+          | r -> r
+          | exception Not_found ->
+            let r = match e with
+              | App { f; a; _ } -> app (go f off) (go a off)
+              | Lam { ty; b; _ } -> lam (go ty off) (go b (off + 1))
+              | Pi { ty; b; _ } -> pi (go ty off) (go b (off + 1))
+              | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
+              | Proj { s; idx; e; _ } -> proj s idx (go e off)
+              | _ -> e in
+            Tbl2.add cache (e, off) r; r in
+    go e 0
+  end
+
 (* Lean's instantiate(e, n, s): bvar k := s.(k) *)
-let instantiate e (s : t array) = instantiate_gen e (Array.length s) (fun k -> s.(k))
+let instantiate e (s : t array) = instantiate_core e (Array.length s) s 0 false
 (* Lean's instantiate_rev(e, n, s): bvar k := s.(n-1-k) *)
 let instantiate_rev e (s : t array) =
-  let n = Array.length s in instantiate_gen e n (fun k -> s.(n - 1 - k))
-let instantiate_rev_sub e (s : t array) n =
-  instantiate_gen e n (fun k -> s.(n - 1 - k))
+  let n = Array.length s in instantiate_core e n s (n - 1) true
+let instantiate_rev_sub e (s : t array) n = instantiate_core e n s (n - 1) true
+(* bvar k := args.(hi - 1 - k) for k < hi - lo: the arguments args.(lo..hi-1) as a
+   reversed substitution, as used for beta reduction of [f args] *)
+let instantiate_args e (args : t array) lo hi = instantiate_core e (hi - lo) args (hi - 1) true
 
 (* abstract fvars xs.(0..n-1): fvar xs.(j) becomes bvar (off + n - 1 - j) *)
 let abstract e (xs : t array) n =
   if not (has_fvar e) || n = 0 then e else begin
     let cache = Tbl2.create 32 in
+    let find_idx id =
+      let rec find j = if j < 0 then -1 else
+          (match Array.unsafe_get xs j with FVar x when x.id = id -> j | _ -> find (j - 1)) in
+      find (n - 1) in
     let rec go e off =
       if not (has_fvar e) then e else
         match e with
         | FVar { id; _ } ->
-          let rec find j = if j < 0 then e else
-              (match xs.(j) with FVar x when x.id = id -> bvar (off + n - 1 - j) | _ -> find (j - 1)) in
-          find (n - 1)
+          let j = find_idx id in if j < 0 then e else bvar (off + n - 1 - j)
         | _ ->
           match Tbl2.find cache (e, off) with
           | r -> r
@@ -266,12 +327,12 @@ let mk_lambda_l xs b = mk_lambda (Array.of_list xs) b
 
 (* ---------- universe parameter instantiation ---------- *)
 let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
-  if ps = [] || not (has_lparam e) then e else begin
-    let cache = Tbl.create 64 in
+  if (match ps with [] -> true | _ -> false) || not (has_lparam e) then e else begin
+    let cache = Tbl2.create 64 in
     let lv l = Level.instantiate ps ls l in
     let rec go e =
       if not (has_lparam e) then e else
-        match Tbl.find cache e with
+        match Tbl2.find cache (e, 0) with
         | r -> r
         | exception Not_found ->
           let r = match e with
@@ -283,7 +344,7 @@ let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
             | Let { ty; v; b; _ } -> let_ (go ty) (go v) (go b)
             | Proj { s; idx; e; _ } -> proj s idx (go e)
             | _ -> e in
-          Tbl.add cache e r; r in
+          Tbl2.add cache (e, 0) r; r in
     go e
   end
 

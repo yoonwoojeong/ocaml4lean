@@ -14,6 +14,7 @@ module H = Hc.Make (struct
       | Num a, Num b -> a.pre == b.pre && a.n = b.n
       | _ -> false
     let hash = hash
+    let dummy = Anon
   end)
 
 let str pre s = H.intern (Str { h = Hc.mix (hash pre) (Hashtbl.hash s); pre; s })
@@ -69,3 +70,9 @@ let rec append a b = match b with
   | Anon -> a
   | Str { pre; s; _ } -> str (append a pre) s
   | Num { pre; n; _ } -> num (append a pre) n
+
+module Tbl = Hashtbl.Make (struct
+    type nonrec t = t
+    let equal = equal
+    let hash = hash
+  end)

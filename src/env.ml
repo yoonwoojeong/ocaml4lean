@@ -38,7 +38,7 @@ type block =
   | IndBlock of { types : cinfo list; ctors : cinfo list; recs : cinfo list }
 
 type t = {
-  consts : (Name.t, cinfo) Hashtbl.t;
+  consts : cinfo Name.Tbl.t;
   blocks : block array;
   dups : Name.t list;            (* names declared more than once *)
 }
