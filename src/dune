@@ -1,0 +1,5 @@
+(library
+ (name kernel)
+ (libraries zarith)
+ (ocamlopt_flags (:standard -O3 -inline 200 -unsafe))
+ (flags (:standard -w +a-4-9-26-27-32-35-37-40-41-42-44-45-69-70 -warn-error -a)))
