@@ -198,13 +198,16 @@ let line st (s : string) =
   | _ -> bad "line is not an object"
 
 (* fast path for name / level / expression lines *)
-let fast_line st (l : string) : bool =
+(* build the entry of a line already scanned into [st.fl]; false: not handled *)
+let rec fast_line st (l : Bytes.t) start stop : bool =
+  Fastline.scan st.fl l start stop && fast_build st l
+and fast_build st (l : Bytes.t) : bool =
   let f = st.fl in
-  Fastline.scan f l && begin
+  begin
     let open Fastline in
     let iv k = f.ints.(k) in
     let has k = f.ints.(k) <> min_int in
-    let sv k = if f.slen.(k) < 0 then raise Exit else String.sub l f.sstart.(k) f.slen.(k) in
+    let sv k = if f.slen.(k) < 0 then raise Exit else Bytes.sub_string l f.sstart.(k) f.slen.(k) in
     let nm k = get st.names (iv k) "name" and lv k = get st.levels (iv k) "level" and ex k = get st.exprs (iv k) "expr" in
     try
       if has k_ie then begin
@@ -262,16 +265,44 @@ let read_channel ?(size_hint = 0) ic : Env.t =
   Idx.set st.names 0 Name.Anon;
   Idx.set st.levels 0 Level.zero;
   let lineno = ref 0 in
-  (try
-     while true do
-       let l = input_line ic in
-       incr lineno;
-       if String.length l > 0 then
-         (try if not (fast_line st l) then line st l with
-          | J.Error m -> bad "line %d: json error: %s" !lineno m
-          | Bad m -> bad "line %d: %s" !lineno m
-          | Failure m | Invalid_argument m -> bad "line %d: %s" !lineno m)
-     done
-   with End_of_file -> ());
+  (* Lines are scanned in place in a large buffer refilled with [input]: one
+     channel operation (and lock) per megabyte instead of per line, and no
+     string allocated for lines the fast path handles. *)
+  let buf = ref (Bytes.create (1 lsl 20)) in
+  let lo = ref 0 and hi = ref 0 and eof = ref false in
+  let refill () =
+    (* keep the unfinished line, at the front; grow for very long lines *)
+    let rem = !hi - !lo in
+    if rem = Bytes.length !buf then begin
+      let nb = Bytes.create (2 * Bytes.length !buf) in
+      Bytes.blit !buf !lo nb 0 rem; buf := nb
+    end else Bytes.blit !buf !lo !buf 0 rem;
+    lo := 0; hi := rem;
+    let k = input ic !buf !hi (Bytes.length !buf - !hi) in
+    if k = 0 then eof := true else hi := !hi + k in
+  let handle ?(scanned = false) start stop =
+    incr lineno;
+    let b = !buf in
+    if stop > start then
+      (try
+         let ok = if scanned then fast_build st b else fast_line st b start stop in
+         if not ok then line st (Bytes.sub_string b start (stop - start)) with
+       | J.Error m -> bad "line %d: json error: %s" !lineno m
+       | Bad m -> bad "line %d: %s" !lineno m
+       | Failure m | Invalid_argument m -> bad "line %d: %s" !lineno m) in
+  let rec next () =
+    let b = !buf and h = !hi in
+    (* fast path: scanning the object finds the end of the line, so the bytes
+       are read once; otherwise search for the newline *)
+    let e = Fastline.scan_prefix st.fl b !lo h in
+    if e >= 0 && e < h && Bytes.unsafe_get b e = '\n' then begin
+      let start = !lo in lo := e + 1; handle ~scanned:true start e; next ()
+    end else
+    let i = ref !lo in
+    while !i < h && Bytes.unsafe_get b !i <> '\n' do incr i done;
+    if !i < h then (let start = !lo in lo := !i + 1; handle start !i; next ())
+    else if !eof then (if h > !lo then (let start = !lo in lo := h; handle start h))
+    else (refill (); next ()) in
+  next ();
   flush_quot st;
   { consts = st.consts; blocks = Array.of_list (List.rev st.blocks); dups = st.dups }

@@ -86,6 +86,66 @@ The first arena run (2026-11-08) found two problems, both fixed since:
   hash-cons table after parsing would save little more and costs ~45% check
   time, so it is not done.
 
+## Second optimization round: techniques from other kernels
+
+Other arena kernels, chiefly [sokonanoda](https://github.com/intgrah/sokonanoda) and
+[pestka](https://github.com/jasisz/pestka), were read for techniques that suit this design. Four were ported, one at a time, each measured
+against `main` (8715624) on OCaml 5.4.0. Raw data: `bench/results/optimization-round-2.txt`;
+`bench/quick.sh BINARY` reruns the main measurements.
+
+| workload | before: parse + check | after: parse + check | check time |
+|---|---:|---:|---:|
+| Init, 1 domain | 7.8 + 76.4 s | 5.9 + 48.7 s | −36% |
+| Init, 4 domains | 7.3 + 20.2 s | 6.1 + 15.8 s | −22% |
+| Std, 4 domains | 12.2 + 49.0 s | 10.1 + 26.1 s | −47% |
+| Lean, 4 domains | 16.1 + 56.0 s | 12.4 + 29.9 s | −47% |
+| Mathlib proxy (6.2 GB), 4 domains | 585 s total | 436 s total | −36% total |
+
+Peak RSS is unchanged within 3% (proxy 8.06 → 8.16 GB). The adversarial perf
+cases (`app-lam`, `beta-ladder`, `magma`) are unchanged within run-to-run noise: they
+are single large declarations, which session caches cannot help.
+
+1. **Session caches** (sokonanoda's `TcCache` sessions, Pestka's session reuse). A
+   domain keeps its caches across declarations instead of discarding them after each
+   one. It keeps infer-only types, weak head normal forms, unfoldings, and def-eq
+   successes and failures. The session is reset after an entry budget is exceeded
+   (`O4L_SESSION`, 10⁶ entries; `0` disables it).
+   *Soundness:*
+   * Only results that do not depend on the declaration are kept. These are facts
+     about closed terms and the constants they mention. Constants never change, and a
+     domain visits blocks in increasing order, so a later declaration sees a superset
+     of the constants. Failure records only gate a shortcut.
+   * Checking-mode inference depends on the declaration's universe parameters and
+     safety, so it is never shared.
+   * Contexts that change what names mean (inductive blocks, unsafe or partial
+     definitions that see themselves) never use a session.
+
+   *Performance:* only hash-consed environment terms are session keys. Their
+   equality is pointer equality. A first version keyed the session on all terms; it
+   compared rebuilt copies of large terms structurally and took Init from 77 s to
+   over 18 minutes.
+2. **Chunked scheduling** (sokonanoda's `CHUNK_SIZE = 64`). Domains claim 64
+   consecutive blocks at a time (`O4L_CHUNK`), so related declarations land in the
+   same session. Alone this is neutral; it is what makes sessions pay off with 4
+   domains.
+3. **Pair-hash fix** (found while profiling 1). `Hc.mix h x` depends only on `h lxor x`,
+   and the def-eq pair caches hashed a pair as `mix ha hb`. So every two pairs with
+   the same XOR of hashes collided, which is common for terms that differ in one
+   argument, and probing scanned long clusters. Mixing in two order-dependent steps
+   took Init (1 domain, with sessions) from 161 s to 50 s.
+4. **Parser** (sokonanoda's block reader and fixed-shape scanner). The input is read in
+   1 MB chunks and lines are scanned in place, with no string per line and no channel
+   lock per line. The newline is found by the scanner itself, so bytes are read once.
+   Keys are looked up in a table indexed by length and first and last character, and
+   only the slots a line set are reset. Parsing the 827 MB `Lean` export went from
+   16.1 s to 12.4 s. Lines the fast path does not take still go to the generic JSON
+   parser, as before. Most of the remaining parse time is hash-consing: lookups into
+   the 134 M-slot environment table miss the cache.
+
+Considered and not ported: skipping comparison of proof arguments (Pestka). It is
+justified by proof irrelevance, but deciding that an argument is a proof needs type
+inference, so the saving is small, and it changes which def-eq checks are made.
+
 ## Comparison with nanoda, con-leche and con-ron
 
 Not measured. Building them (Rust/Lean projects from GitHub) was blocked by the
