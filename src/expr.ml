@@ -187,6 +187,51 @@ module Emap = struct
     t.n <- t.n + 1
 end
 
+(* Open-addressing set of unordered expression pairs (structural equality),
+   used for the definitional-equality success/failure caches. *)
+module Pset = struct
+  type t = { mutable hs : int array; mutable as_ : expr array; mutable bs : expr array;
+             mutable n : int; mutable mask : int }
+  let create cap =
+    let cap = let c = ref 16 in while !c < 2 * cap do c := 2 * !c done; !c in
+    { hs = Array.make cap 0; as_ = Array.make cap Emap.dummy_key; bs = Array.make cap Emap.dummy_key;
+      n = 0; mask = cap - 1 }
+  (* order the pair by hash so that (a, b) and (b, a) are the same key *)
+  let key a b = let ha = hash a and hb = hash b in
+    if ha <= hb then ((mix ha hb) lor 1) land max_int else ((mix hb ha) lor 1) land max_int
+  let mem t a b =
+    let h = key a b in
+    let mask = t.mask in
+    let rec go i =
+      let x = Array.unsafe_get t.hs i in
+      if x = 0 then false
+      else if x = h &&
+              (let p = Array.unsafe_get t.as_ i and q = Array.unsafe_get t.bs i in
+               (equal p a && equal q b) || (equal p b && equal q a)) then true
+      else go ((i + 1) land mask) in
+    go (h land mask)
+  let rec slot hs mask i = if Array.unsafe_get hs i = 0 then i else slot hs mask ((i + 1) land mask)
+  let grow t =
+    let cap = 2 * (t.mask + 1) in
+    let mask = cap - 1 in
+    let hs = Array.make cap 0 and as_ = Array.make cap Emap.dummy_key and bs = Array.make cap Emap.dummy_key in
+    for i = 0 to t.mask do
+      let h = t.hs.(i) in
+      if h <> 0 then begin
+        let j = slot hs mask (h land mask) in
+        hs.(j) <- h; as_.(j) <- t.as_.(i); bs.(j) <- t.bs.(i)
+      end
+    done;
+    t.hs <- hs; t.as_ <- as_; t.bs <- bs; t.mask <- mask
+  let add t a b =
+    if not (mem t a b) then begin
+      if 2 * (t.n + 1) > t.mask + 1 then grow t;
+      let h = key a b in
+      let j = slot t.hs t.mask (h land t.mask) in
+      t.hs.(j) <- h; t.as_.(j) <- a; t.bs.(j) <- b; t.n <- t.n + 1
+    end
+end
+
 (* ---------- application spines ---------- *)
 let rec get_app_fn = function App { f; _ } -> get_app_fn f | e -> e
 let rec get_app_num_args e = match e with App { f; _ } -> 1 + get_app_num_args f | _ -> 0
@@ -274,19 +319,43 @@ module Memo = struct
   (* traversal kinds: 0 lift, 1 lower, 2 instantiate, 3 abstract, 4 lparams *)
   let get k = let m = (Domain.DLS.get key_dls).(k) in clear m; m
 end
+(* Small traversals use a fresh hash table (it stays in the minor heap and
+   dies young); traversals of big terms (saturated size) use the reusable
+   flat-array memo, avoiding the promotion of many cache cells. *)
+(* A traversal starts with a fresh hash table (it lives in the minor heap and
+   dies young).  Once it has more than [migrate_at] entries -- a big term -- it
+   moves to the reusable flat-array memo of its kind, which avoids the GC
+   promotion of many short-lived cache cells. *)
+let migrate_at = (match Sys.getenv_opt "O4L_MIGRATE" with Some v -> int_of_string v | None -> 256)
+module MemoH = struct
+  type c = { kind : int; mutable small : t Tbl2.t; mutable big : Memo.m option }
+  let get_for (_ : t) k = { kind = k; small = Tbl2.create 16; big = None }
+  let find c e off = match c.big with
+    | Some m -> Memo.find m e off
+    | None -> Tbl2.find c.small (e, off)
+  let add c e off v = match c.big with
+    | Some m -> Memo.add m e off v
+    | None ->
+      Tbl2.add c.small (e, off) v;
+      if Tbl2.length c.small > migrate_at then begin
+        let m = Memo.get c.kind in
+        Tbl2.iter (fun (e, off) v -> Memo.add m e off v) c.small;
+        c.big <- Some m; c.small <- Tbl2.create 1
+      end
+end
 
 (* Only subterms of at least this (tree) size are memoised: smaller ones are
    cheaper to rebuild than to look up, and exponential blow-up through DAG
    sharing can only come from large shared subterms. *)
-let memo_min = (match Sys.getenv_opt "O4L_MEMO_MIN" with Some v -> int_of_string v | None -> 32)
+let memo_min = (match Sys.getenv_opt "O4L_MEMO_MIN" with Some v -> int_of_string v | None -> 0)
 
 (* lift loose bvars >= s by d *)
 let lift_loose e s d =
   if d = 0 || lbr e <= s then e else begin
-    let cache = Memo.get 0 in
+    let cache = MemoH.get_for e 0 in
     let rec go e off =
       if lbr e <= s + off then e else
-        match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
+        match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
         | r -> r
         | exception Not_found ->
           let r = match e with
@@ -297,17 +366,17 @@ let lift_loose e s d =
             | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
             | Proj { s; idx; e; _ } -> proj s idx (go e off)
             | _ -> e in
-          if size e >= memo_min then Memo.add cache e off r; r in
+          if size e >= memo_min then MemoH.add cache e off r; r in
     go e 0
   end
 
 (* lower loose bvars >= s by d (caller guarantees no bvar in [s-d, s) occurs) *)
 let lower_loose e s d =
   if d = 0 || lbr e <= s then e else begin
-    let cache = Memo.get 1 in
+    let cache = MemoH.get_for e 1 in
     let rec go e off =
       if lbr e <= s + off then e else
-        match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
+        match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
         | r -> r
         | exception Not_found ->
           let r = match e with
@@ -318,7 +387,7 @@ let lower_loose e s d =
             | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
             | Proj { s; idx; e; _ } -> proj s idx (go e off)
             | _ -> e in
-          if size e >= memo_min then Memo.add cache e off r; r in
+          if size e >= memo_min then MemoH.add cache e off r; r in
     go e 0
   end
 
@@ -327,7 +396,7 @@ let lower_loose e s d =
    [subst k] = arr.(base - k) if [rev] else arr.(base + k). *)
 let instantiate_core e n (arr : t array) base rev =
   if closed e || n = 0 then e else begin
-    let cache = Memo.get 2 in
+    let cache = MemoH.get_for e 2 in
     let get k = if rev then Array.unsafe_get arr (base - k) else Array.unsafe_get arr (base + k) in
     let rec go e off =
       if lbr e <= off then e else
@@ -336,7 +405,7 @@ let instantiate_core e n (arr : t array) base rev =
           let k = idx - off in
           if k < n then lift_loose (get k) 0 off else bvar (idx - n)
         | _ ->
-          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
+          match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
@@ -346,7 +415,7 @@ let instantiate_core e n (arr : t array) base rev =
               | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
               | Proj { s; idx; e; _ } -> proj s idx (go e off)
               | _ -> e in
-            if size e >= memo_min then Memo.add cache e off r; r in
+            if size e >= memo_min then MemoH.add cache e off r; r in
     go e 0
   end
 
@@ -355,13 +424,13 @@ let instantiate_gen e n (get : int -> t) = instantiate_core e n (Array.init n ge
 (* bvar 0 := v *)
 let instantiate1 e v =
   if closed e then e else begin
-    let cache = Memo.get 2 in
+    let cache = MemoH.get_for e 2 in
     let rec go e off =
       if lbr e <= off then e else
         match e with
         | BVar { idx; _ } -> if idx = off then lift_loose v 0 off else bvar (idx - 1)
         | _ ->
-          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
+          match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
@@ -371,7 +440,7 @@ let instantiate1 e v =
               | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
               | Proj { s; idx; e; _ } -> proj s idx (go e off)
               | _ -> e in
-            if size e >= memo_min then Memo.add cache e off r; r in
+            if size e >= memo_min then MemoH.add cache e off r; r in
     go e 0
   end
 
@@ -388,7 +457,7 @@ let instantiate_args e (args : t array) lo hi = instantiate_core e (hi - lo) arg
 (* abstract fvars xs.(0..n-1): fvar xs.(j) becomes bvar (off + n - 1 - j) *)
 let abstract e (xs : t array) n =
   if not (has_fvar e) || n = 0 then e else begin
-    let cache = Memo.get 3 in
+    let cache = MemoH.get_for e 3 in
     let find_idx id =
       let rec find j = if j < 0 then -1 else
           (match Array.unsafe_get xs j with FVar x when x.id = id -> j | _ -> find (j - 1)) in
@@ -399,7 +468,7 @@ let abstract e (xs : t array) n =
         | FVar { id; _ } ->
           let j = find_idx id in if j < 0 then e else bvar (off + n - 1 - j)
         | _ ->
-          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
+          match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
@@ -409,7 +478,7 @@ let abstract e (xs : t array) n =
               | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
               | Proj { s; idx; e; _ } -> proj s idx (go e off)
               | _ -> e in
-            if size e >= memo_min then Memo.add cache e off r; r in
+            if size e >= memo_min then MemoH.add cache e off r; r in
     go e 0
   end
 
@@ -459,11 +528,11 @@ let mk_lambda_l xs b = mk_lambda (Array.of_list xs) b
 (* ---------- universe parameter instantiation ---------- *)
 let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
   if (match ps with [] -> true | _ -> false) || not (has_lparam e) then e else begin
-    let cache = Memo.get 4 in
+    let cache = MemoH.get_for e 4 in
     let lv l = Level.instantiate ps ls l in
     let rec go e =
       if not (has_lparam e) then e else
-        match (if size e < memo_min then raise Not_found else Memo.find cache e 0) with
+        match (if size e < memo_min then raise Not_found else MemoH.find cache e 0) with
         | r -> r
         | exception Not_found ->
           let r = match e with
@@ -475,7 +544,7 @@ let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
             | Let { ty; v; b; _ } -> let_ (go ty) (go v) (go b)
             | Proj { s; idx; e; _ } -> proj s idx (go e)
             | _ -> e in
-          if size e >= memo_min then Memo.add cache e 0 r; r in
+          if size e >= memo_min then MemoH.add cache e 0 r; r in
     go e
   end
 

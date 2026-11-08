@@ -49,8 +49,8 @@ type ctx = {
   whnf_core_tbl : Expr.t Emap.t;
   whnf_tbl : Expr.t Emap.t;
   unfold_tbl : Expr.t Emap.t;
-  success : unit PTbl.t;
-  failure : unit PTbl.t;
+  success : Pset.t;
+  failure : Pset.t;
   mutable eager : bool;
 }
 
@@ -61,7 +61,7 @@ let create ?(local = Name.Tbl.create 8) ?(safety = Safe) env bi pos = {
   infer_tbl = Emap.create Emap.dummy_key 64; infer_only_tbl = Emap.create Emap.dummy_key 64;
   whnf_core_tbl = Emap.create Emap.dummy_key 64; whnf_tbl = Emap.create Emap.dummy_key 64;
   unfold_tbl = Emap.create Emap.dummy_key 16;
-  success = PTbl.create 256; failure = PTbl.create 256; eager = false;
+  success = Pset.create 16; failure = Pset.create 16; eager = false;
 }
 
 let find_global c n =
@@ -737,13 +737,10 @@ and is_def_eq_proof_irrel c t s =
   if not (is_prop c t_type) then -1
   else if is_def_eq c t_type (infer c s) then 1 else 0
 
-and ord_pair t s = if Expr.hash t <= Expr.hash s then (t, s) else (s, t)
-and failed_before c t s =
-  PTbl.mem c.failure (t, s) || PTbl.mem c.failure (s, t)
-and cache_failure c t s = PTbl.replace c.failure (ord_pair t s) ()
-and succeeded_before c t s =
-  PTbl.mem c.success (t, s) || PTbl.mem c.success (s, t)
-and cache_success c t s = PTbl.replace c.success (ord_pair t s) ()
+and failed_before c t s = Pset.mem c.failure t s
+and cache_failure c t s = Pset.add c.failure t s
+and succeeded_before c t s = Pset.mem c.success t s
+and cache_success c t s = Pset.add c.success t s
 
 and try_unfold_proj_app c e =
   match get_app_fn e with
