@@ -124,9 +124,9 @@ let add_inductive_core env bi pos (overlay : cinfo Name.Tbl.t) (d : decl) (nnest
   (* ---- check_constructors ---- *)
   let is_valid_ind_app t idx =
     let fn, args = get_app_args t in
-    fn == ind_consts.(idx) && Array.length args = nparams + nindices.(idx) &&
+    Expr.equal fn ind_consts.(idx) && Array.length args = nparams + nindices.(idx) &&
     (let ok = ref true in
-     for i = 0 to nparams - 1 do if args.(i) != params_a.(i) then ok := false done;
+     for i = 0 to nparams - 1 do if not (Expr.equal args.(i) params_a.(i)) then ok := false done;
      for i = nparams to Array.length args - 1 do if has_ind_occ args.(i) then ok := false done;
      !ok) in
   let which_valid_ind_app t =
@@ -201,7 +201,7 @@ let add_inductive_core env bi pos (overlay : cinfo Name.Tbl.t) (d : decl) (nnest
           incr i
         done;
         let _, result_args = get_app_args !ty in
-        List.exists (fun a -> not (Array.exists (fun r -> r == a) result_args)) !to_check in
+        List.exists (fun a -> not (Array.exists (fun r -> Expr.equal r a) result_args)) !to_check in
   let elim_level =
     if elim_only_at_zero () then Level.zero
     else begin
@@ -348,7 +348,7 @@ let check_uniform_ind_occs (d : decl) =
       (match fn with
        | Const { n; ls; _ } when is_ind n && Array.length args <= nparams ->
          let ok = ref (Array.length args = nparams && off >= nparams &&
-                       List.compare_lengths ls lvls = 0 && List.for_all2 (==) ls lvls) in
+                       List.compare_lengths ls lvls = 0 && List.for_all2 Level.equal ls lvls) in
          for i = 0 to nparams - 1 do
            if !ok then (match args.(i) with BVar { idx; _ } when idx = off - 1 - i -> () | _ -> ok := false)
          done;
@@ -440,7 +440,7 @@ let elim_nested (c : Tc.ctx) (d : decl) : nested_res =
       let inp = iv.nparams in
       let ias = mk_app_sub fn args 0 inp in
       let iparams = replace_params ias as_ in
-      let found = List.find_opt (fun (p, _) -> p == iparams) !nested_aux in
+      let found = List.find_opt (fun (p, _) -> Expr.equal p iparams) !nested_aux in
       (match found with
        | Some (_, auxn) ->
          let auxi = mk_app_arr (Expr.const auxn lvls) as_ in

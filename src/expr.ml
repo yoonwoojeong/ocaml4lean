@@ -74,15 +74,22 @@ let sort l = H.intern_g true (Sort { h = mix 103 (Level.hash l); i = mk_info ~fv
 let const n ls =
   let h = List.fold_left (fun h l -> mix h (Level.hash l)) (mix 107 (Name.hash n)) ls in
   H.intern_g true (Const { h; i = mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0; n; ls })
-let app f a = H.intern_g (g2 f a) (App { h = mix (mix 109 (hash f)) (hash a); i = union (info f) (info a); f; a })
-let lam ty b = H.intern_g (g2 ty b) (Lam { h = mix (mix 113 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
-let pi ty b = H.intern_g (g2 ty b) (Pi { h = mix (mix 127 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
+(* After parsing, new nodes are shared only with the (frozen) environment tier;
+   see Hc.intern_g.  A node can only be in that tier if all its children are. *)
+let app f a =
+  H.intern_g (g2 f a) (App { h = mix (mix 109 (hash f)) (hash a); i = union (info f) (info a); f; a })
+let lam ty b =
+  H.intern_g (g2 ty b) (Lam { h = mix (mix 113 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
+let pi ty b =
+  H.intern_g (g2 ty b) (Pi { h = mix (mix 127 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
 let let_ ty v b =
-  H.intern_g (g3 ty v b) (Let { h = mix (mix (mix 131 (hash ty)) (hash v)) (hash b);
-                  i = union (union (info ty) (info v)) (under (info b)); ty; v; b })
+  H.intern_g (g3 ty v b)
+    (Let { h = mix (mix (mix 131 (hash ty)) (hash v)) (hash b);
+           i = union (union (info ty) (info v)) (under (info b)); ty; v; b })
 let natlit n = H.intern_g true (NatLit { h = mix 137 (Z.hash n); i = gbit (); n })
 let strlit s = H.intern_g true (StrLit { h = mix 139 (Hashtbl.hash s); i = gbit (); s })
-let proj s idx e = H.intern_g (is_global e) (Proj { h = mix (mix (mix 149 (Name.hash s)) idx) (hash e); i = (info e land (lnot 4)) lor gbit (); s; idx; e })
+let proj s idx e =
+  H.intern_g (is_global e) (Proj { h = mix (mix (mix 149 (Name.hash s)) idx) (hash e); i = (info e land (lnot 4)) lor gbit (); s; idx; e })
 
 (* Free variables are never shared between domains: per-domain counter. *)
 let fv_counter = Domain.DLS.new_key (fun () -> ref 0)
@@ -93,6 +100,53 @@ let mk_fvar ?v ty =
   FVar { h = mix 151 id; i = 1; id; ty; v }
 
 let fvar_ty = function FVar { ty; _ } -> ty | _ -> invalid_arg "fvar_ty"
+
+(* ---------- structural equality ----------
+   Free-variable-free nodes are hash-consed, so for them physical equality is
+   structural equality.  Two terms can only be equal if both or neither contain
+   free variables; only then is a structural walk needed.  The walk is
+   memoised once it gets large, so shared sub-DAGs are not unfolded. *)
+module PairTbl = Hashtbl.Make (struct
+    type nonrec t = t * t
+    let equal (a, b) (c, d) = a == c && b == d
+    let hash (a, b) = mix (hash a) (hash b)
+  end)
+
+let equal a b =
+  a == b ||
+  (hash a = hash b && not (is_global a && is_global b) &&
+   (let budget = ref 4096 in
+    let memo = ref None in
+    let rec eq a b =
+      a == b ||
+      (hash a = hash b && not (is_global a && is_global b) &&
+       begin
+         decr budget;
+         if !budget < 0 then begin
+           let m = match !memo with Some m -> m | None -> let m = PairTbl.create 256 in memo := Some m; m in
+           if PairTbl.mem m (a, b) then true
+           else begin
+             let r = shallow a b in
+             if r then PairTbl.replace m (a, b) ();
+             r
+           end
+         end else shallow a b
+       end)
+    and shallow a b = match a, b with
+      | BVar x, BVar y -> x.idx = y.idx
+      | FVar x, FVar y -> x.id = y.id
+      | Sort x, Sort y -> Level.equal x.l y.l
+      | Const x, Const y ->
+        Name.equal x.n y.n && List.compare_lengths x.ls y.ls = 0 && List.for_all2 Level.equal x.ls y.ls
+      | App x, App y -> eq x.f y.f && eq x.a y.a
+      | Lam x, Lam y -> eq x.ty y.ty && eq x.b y.b
+      | Pi x, Pi y -> eq x.ty y.ty && eq x.b y.b
+      | Let x, Let y -> eq x.ty y.ty && eq x.v y.v && eq x.b y.b
+      | NatLit x, NatLit y -> Z.equal x.n y.n
+      | StrLit x, StrLit y -> String.equal x.s y.s
+      | Proj x, Proj y -> Name.equal x.s y.s && x.idx = y.idx && eq x.e y.e
+      | _ -> false in
+    shallow a b))
 
 (* ---------- application spines ---------- *)
 let rec get_app_fn = function App { f; _ } -> get_app_fn f | e -> e
@@ -116,7 +170,8 @@ let mk_app_list f args = List.fold_left app f args
 let is_app_of e n = match get_app_fn e with Const { n = m; _ } -> m == n || Name.equal m n | _ -> false
 
 (* ---------- caches for traversals over DAGs ---------- *)
-module Tbl = Hashtbl.Make (struct type nonrec t = t let equal = ( == ) let hash = hash end)
+module Tbl = Hashtbl.Make (struct type nonrec t = t let equal = equal let hash = hash end)
+module PhysTbl = Hashtbl.Make (struct type nonrec t = t let equal = ( == ) let hash = hash end)
 module Tbl2 = Hashtbl.Make (struct
     type nonrec t = t * int
     let equal (a, i) (b, j) = a == b && i = j
@@ -350,10 +405,10 @@ let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
 
 (* generic search: does some subterm satisfy p ? (p is applied to every node) *)
 let exists p e =
-  let seen = Tbl.create 64 in
+  let seen = PhysTbl.create 64 in
   let rec go e =
-    if Tbl.mem seen e then false else begin
-      Tbl.add seen e ();
+    if PhysTbl.mem seen e then false else begin
+      PhysTbl.add seen e ();
       p e || (match e with
           | App { f; a; _ } -> go f || go a
           | Lam { ty; b; _ } | Pi { ty; b; _ } -> go ty || go b
@@ -365,9 +420,9 @@ let exists p e =
 
 (* generic replace (no binder offset tracking needed by callers here) *)
 let replace (f : t -> t option) e =
-  let cache = Tbl.create 64 in
+  let cache = PhysTbl.create 64 in
   let rec go e =
-    match Tbl.find cache e with
+    match PhysTbl.find cache e with
     | r -> r
     | exception Not_found ->
       let r = match f e with
@@ -379,7 +434,7 @@ let replace (f : t -> t option) e =
           | Let { ty; v; b; _ } -> let_ (go ty) (go v) (go b)
           | Proj { s; idx; e; _ } -> proj s idx (go e)
           | _ -> e in
-      Tbl.add cache e r; r in
+      PhysTbl.add cache e r; r in
   go e
 
 (* ---------- printing (diagnostics only) ---------- *)

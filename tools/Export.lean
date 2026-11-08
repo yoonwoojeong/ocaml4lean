@@ -4,7 +4,8 @@
   toolchain.  Declarations are emitted in dependency order (post-order DFS);
   unsafe declarations and `mdata` are omitted, as in lean4export's default mode.
 
-  usage: lean --run Export.lean <Module>... > out.ndjson
+  usage: lean --run Export.lean <Module>... [-- <decl>...] > out.ndjson
+  With `-- decls`, only those declarations and their dependencies are written.
 -/
 import Lean
 open Lean
@@ -191,7 +192,10 @@ partial def emitBlock (blk : Array ConstantInfo) : M Unit := do
 end
 
 def main (args : List String) : IO Unit := do
-  let mods := args.toArray.map fun s => ({ module := s.toName } : Import)
+  let (modArgs, declArgs) := match args.span (· != "--") with
+    | (m, _ :: d) => (m, some d)
+    | (m, []) => (m, none)
+  let mods := modArgs.toArray.map fun s => ({ module := s.toName } : Import)
   initSearchPath (← findSysroot)
   let env ← importModules mods {} (trustLevel := 1024)
   let h ← IO.getStdout
@@ -200,6 +204,8 @@ def main (args : List String) : IO Unit := do
       ("format", Json.mkObj [("version", "3.1.0")]),
       ("lean", Json.mkObj [("version", Lean.versionString), ("githash", Lean.githash)])])])
     -- deterministic order: sort constant names
-    let names := env.constants.toList.map (·.1) |>.toArray.qsort Name.lt
+    let names := match declArgs with
+      | some ds => ds.toArray.map String.toName
+      | none => (env.constants.toList.map (fun (p : Name × ConstantInfo) => p.1)).toArray.qsort Name.lt
     for n in names do dumpConst n
   discard <| (act.run {}).run (env, h)

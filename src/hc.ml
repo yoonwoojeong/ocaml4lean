@@ -97,12 +97,26 @@ module Make (H : sig include S val dummy : t end) = struct
   let global = T.create H.dummy 65536
   let local : T.t Domain.DLS.key = Domain.DLS.new_key (fun () -> T.create H.dummy 4096)
 
+  (* After parsing, values not found in the (frozen) global tier are simply
+     returned unshared: maintaining a mutable scratch tier costs more (write
+     barriers, table growth, GC marking) than sharing saves.  [try_global] is
+     false when the value cannot be in the global tier (some child is not). *)
   let intern_g try_global (x : H.t) : H.t =
     let h = T.key (H.hash x) in
     if not !frozen then
       (match T.find global x h with y -> y | exception Not_found -> T.add global x h; x)
+    else if try_global then
+      (match T.find global x h with y -> y | exception Not_found -> x)
+    else x
+
+  (* Names and levels are few: keep a per-domain scratch tier for them so that
+     they stay canonical (level normalisation compares them physically). *)
+  let intern_local (x : H.t) : H.t =
+    let h = T.key (H.hash x) in
+    if not !frozen then
+      (match T.find global x h with y -> y | exception Not_found -> T.add global x h; x)
     else begin
-      match (if try_global then T.find global x h else raise Not_found) with
+      match T.find global x h with
       | y -> y
       | exception Not_found ->
         let l = Domain.DLS.get local in
@@ -111,7 +125,7 @@ module Make (H : sig include S val dummy : t end) = struct
         | exception Not_found -> T.add l x h; x
     end
 
-  let intern x = intern_g true x
+  let intern x = intern_local x
 
   let reset_local () = T.clear (Domain.DLS.get local)
   let global_size () = global.T.n

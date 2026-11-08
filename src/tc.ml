@@ -10,7 +10,7 @@ let fail fmt = Printf.ksprintf (fun s -> raise (Kernel_error s)) fmt
 module Tbl = Expr.Tbl
 module PTbl = Hashtbl.Make (struct
     type nonrec t = Expr.t * Expr.t
-    let equal (a, b) (c, d) = a == c && b == d
+    let equal (a, b) (c, d) = Expr.equal a c && Expr.equal b d
     let hash (a, b) = Hc.mix (Expr.hash a) (Expr.hash b)
   end)
 
@@ -388,7 +388,7 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
              (* bvar k := args.(m - 1 - k) *)
              let r = instantiate_args body args 0 m in
              whnf_core ~cheap_rec ~cheap_proj c (mk_app_sub r args m n)
-           | _ when f == f0 ->
+           | _ when f == f0 || Expr.equal f f0 ->
              (match reduce_recursor c e cheap_rec cheap_proj with
               | Some r -> whnf_core ~cheap_rec ~cheap_proj c r
               | None -> e)
@@ -672,7 +672,7 @@ and is_def_eq_binding c t s =
   go' t s
 
 and quick_is_def_eq c t s : int (* 1 true, 0 false, -1 unknown *) =
-  if t == s || succeeded_before c t s then 1
+  if Expr.equal t s || succeeded_before c t s then 1
   else match t, s with
     | Lam _, Lam _ | Pi _, Pi _ -> if is_def_eq_binding c t s then 1 else 0
     | Sort { l = l1; _ }, Sort { l = l2; _ } -> if Level.is_equiv l1 l2 then 1 else 0
@@ -746,7 +746,7 @@ and cache_success c t s = PTbl.replace c.success (ord_pair t s) ()
 
 and try_unfold_proj_app c e =
   match get_app_fn e with
-  | Proj _ -> let e' = whnf_core c e in if e' != e then Some e' else None
+  | Proj _ -> let e' = whnf_core c e in if not (Expr.equal e' e) then Some e' else None
   | _ -> None
 
 (* returns: 0 continue, 1 equal, 2 different, 3 unknown *)

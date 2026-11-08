@@ -9,21 +9,7 @@ let check_lparams (ci : cinfo) =
   | Some n -> fail "duplicate universe level parameter '%s'" (Name.to_string n)
   | None -> ()
 
-(* structural equality (robust even across hash-consing tiers) *)
-let rec expr_equal (a : Expr.t) (b : Expr.t) =
-  let open Expr in
-  a == b || (hash a = hash b && match a, b with
-    | BVar x, BVar y -> x.idx = y.idx
-    | Sort x, Sort y -> Level.equal x.l y.l
-    | Const x, Const y -> Name.equal x.n y.n && List.length x.ls = List.length y.ls && List.for_all2 Level.equal x.ls y.ls
-    | App x, App y -> expr_equal x.f y.f && expr_equal x.a y.a
-    | Lam x, Lam y -> expr_equal x.ty y.ty && expr_equal x.b y.b
-    | Pi x, Pi y -> expr_equal x.ty y.ty && expr_equal x.b y.b
-    | Let x, Let y -> expr_equal x.ty y.ty && expr_equal x.v y.v && expr_equal x.b y.b
-    | NatLit x, NatLit y -> Z.equal x.n y.n
-    | StrLit x, StrLit y -> String.equal x.s y.s
-    | Proj x, Proj y -> Name.equal x.s y.s && x.idx = y.idx && expr_equal x.e y.e
-    | _ -> false)
+let expr_equal = Expr.equal
 
 let names_equal a b = List.length a = List.length b && List.for_all2 Name.equal a b
 
@@ -217,12 +203,14 @@ let builtins (env : Env.t) =
   let ty_ok n ty = match get n with Some ci -> ci.lparams = [] && expr_equal ci.ty ty && not ci.unsafe | None -> false in
   let typ = sort Level.one in
   let bool = const (Name.of_string "Bool") [] in
+  let bool_ok () =
+    ind_ok "Bool" 0 typ ["Bool.false"; "Bool.true"] && ty_ok "Bool.false" bool && ty_ok "Bool.true" bool in
   let nat_ok =
     ind_ok "Nat" 0 typ ["Nat.zero"; "Nat.succ"] &&
     ty_ok "Nat.zero" nat && ty_ok "Nat.succ" (pi nat nat) &&
-    ind_ok "Bool" 0 typ ["Bool.false"; "Bool.true"] &&
-    ty_ok "Bool.false" bool && ty_ok "Bool.true" bool &&
-    List.for_all (fun (n, r) -> match get n with None -> true | Some _ -> ty_ok n (pi nat (pi nat r)))
+    List.for_all (fun (n, r) -> match get n with
+        | None -> true
+        | Some _ -> ty_ok n (pi nat (pi nat r)) && (r != bool || bool_ok ()))
       [ ("Nat.add", nat); ("Nat.sub", nat); ("Nat.mul", nat); ("Nat.pow", nat); ("Nat.gcd", nat);
         ("Nat.mod", nat); ("Nat.div", nat); ("Nat.beq", bool); ("Nat.ble", bool); ("Nat.land", nat);
         ("Nat.lor", nat); ("Nat.xor", nat); ("Nat.shiftLeft", nat); ("Nat.shiftRight", nat) ] in
