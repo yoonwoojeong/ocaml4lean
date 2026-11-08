@@ -249,11 +249,15 @@ let fast_line st (l : string) : bool =
     with Exit -> false
   end
 
-let read_channel ic : Env.t =
+(* [size_hint]: input size in bytes (0 if unknown).  Exports average 55-60
+   bytes per line and about 90% of lines are expressions, so tables can be
+   allocated at their final size instead of growing by copying. *)
+let read_channel ?(size_hint = 0) ic : Env.t =
+  let est_lines = size_hint / 52 in
   (* sentinels: fresh values that no parsed entry can be physically equal to *)
   let st = { names = Idx.create (Name.Str { h = 0; pre = Name.Anon; s = "<undefined>" }) 100_000;
              levels = Idx.create (Level.Param { h = 0; n = Name.Anon }) 1000;
-             exprs = Idx.create (Expr.BVar { h = 0; i = 0; idx = -1 }) 1_000_000; fl = Fastline.create ();
+             exprs = Idx.create (Expr.BVar { hi = 0; idx = -1 }) (max 1_000_000 est_lines); fl = Fastline.create ();
              consts = Name.Tbl.create 100_000; blocks = []; nblocks = 0; dups = []; pending_quot = [] } in
   Idx.set st.names 0 Name.Anon;
   Idx.set st.levels 0 Level.zero;

@@ -38,8 +38,9 @@ module Set (H : S) = struct
   (* [used] records occupied slots (only for scratch tables, [track]) so that
      clearing costs O(entries) rather than O(capacity). *)
 
+  (* capacity: smallest power of two holding [cap] entries below 3/4 load *)
   let create ?(track = false) dummy cap =
-    let cap = let c = ref 16 in while !c < 2 * cap do c := 2 * !c done; !c in
+    let cap = let c = ref 16 in while 3 * !c < 4 * (cap + 1) do c := 2 * !c done; !c in
     { hs = hs_make cap; vs = Array.make cap dummy; n = 0; mask = cap - 1; dummy;
       used = (if track then Array.make 1024 0 else [||]); track }
 
@@ -103,6 +104,18 @@ module Make (H : sig include S val dummy : t end) = struct
   module T = Set (H)
 
   let global = T.create H.dummy 65536
+  (* Size the table for [n] entries up front (call before parsing): growing it
+     copies the arrays, with old and new alive at once and the old ones left as
+     garbage -- the largest transient of parsing a big environment. *)
+  let presize n =
+    if n > global.T.n && 4 * n > 3 * (global.T.mask + 1) then begin
+      let fresh = T.create H.dummy n in
+      for i = 0 to global.T.mask do
+        let h = T.hs_get global.T.hs i in
+        if h <> 0 then T.add fresh global.T.vs.(i) h
+      done;
+      global.T.hs <- fresh.T.hs; global.T.vs <- fresh.T.vs; global.T.mask <- fresh.T.mask; global.T.n <- fresh.T.n
+    end
   let global_n = ref 0
   (* After parsing, the table is only needed for an optional sharing lookup;
      dropping it frees several words per environment node.  The global nodes

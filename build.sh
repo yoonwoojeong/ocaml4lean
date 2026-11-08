@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 OUT=_obuild
 rm -rf "$OUT"; mkdir -p "$OUT"
 FLAGS="-unsafe -inline 200"
-if ocamlopt -config | grep -q '^flambda: true'; then FLAGS="$FLAGS -O3"; fi
+if ocamlopt -config | grep -qE '^flambda2?: true'; then FLAGS="$FLAGS -O3"; fi
 # library modules in dependency order, packed into a module Kernel
 MODS="hc name level z expr vec env json fastline parse tc inductive check"
 CMX=""

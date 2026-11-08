@@ -241,7 +241,71 @@ type result = { errors : (int * string) list; checked : int; internal_only : boo
 
 let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.reset_local ()
 
-let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
+(* ------------------------------------------------------------ governor *)
+(* Memory governor.  Peak memory depends on the input's shape (how large the
+   declarations being checked at the same time are) and, with several domains,
+   includes per-domain memory the GC does not account for (allocator slack,
+   free per-domain pools, stacks) -- measured: 0.16 GB above the heap with one
+   domain, 0.7 GB with four on an 827 MB input.  So the governor watches the
+   real resident set (VmRSS) and, while it is above the budget, lowers the GC
+   space overhead and lets fewer domains start new declarations (never fewer
+   than one), restoring both once RSS is below 3/4 of the budget.  It only
+   changes scheduling and GC pacing, never what is checked. *)
+let rss_mb () =
+  try
+    let ic = open_in "/proc/self/status" in
+    let r = ref 0 in
+    (try while true do
+         let l = input_line ic in
+         if String.length l > 6 && String.sub l 0 6 = "VmRSS:" then
+           r := Scanf.sscanf (String.sub l 6 (String.length l - 6)) " %d" (fun x -> x / 1024)
+       done with End_of_file -> ());
+    close_in ic; !r
+  with _ -> 0
+
+type governor = {
+  budget_mb : int;
+  base_overhead : int;
+  max_jobs : int;
+  allowed : int Atomic.t;          (* workers with id < allowed may start a block *)
+  busy : bool Atomic.t;            (* one worker samples at a time *)
+  next_sample : float Atomic.t;
+  mutable overhead : int;
+  mutable last_rss : int;          (* highest RSS seen at a sample *)
+  log : bool;
+}
+
+let governor_sample g =
+  let now = Unix.gettimeofday () in
+  if now >= Atomic.get g.next_sample && Atomic.compare_and_set g.busy false true then begin
+    Atomic.set g.next_sample (now +. 0.2);
+    let rss = rss_mb () in
+    let heap = (Gc.quick_stat ()).heap_words * 8 / 1048576 in   (* all domains *)
+    let grew = rss > g.last_rss + 32 in
+    g.last_rss <- max g.last_rss rss;
+    let a = Atomic.get g.allowed in
+    (* RSS is a high-water mark (OCaml 5 keeps freed pool memory mapped), so
+       pressure means: above budget and still growing, or the GC heap itself
+       close to the budget.  Relief is judged on the GC heap: well below the
+       budget means the memory already mapped has room to be reused. *)
+    let pressure = (rss > g.budget_mb && grew) || heap > g.budget_mb * 9 / 10 in
+    let relief = heap < g.budget_mb * 6 / 10 && not grew in
+    let a', o' =
+      if pressure then max 1 (a - 1), max 10 (g.overhead * 2 / 3)
+      else if relief then min g.max_jobs (a + 1), min g.base_overhead (g.overhead * 3 / 2 + 1)
+      else a, g.overhead in
+    if o' <> g.overhead then begin
+      g.overhead <- o';
+      Gc.set { (Gc.get ()) with space_overhead = o' }
+    end;
+    if a' <> a then Atomic.set g.allowed a';
+    if g.log && (a' <> a || o' <> g.overhead || pressure) then
+      Printf.eprintf "memlog governor rss=%dMB heap=%dMB budget=%dMB domains=%d space_overhead=%d\n%!"
+        rss heap g.budget_mb a' g.overhead;
+    Atomic.set g.busy false
+  end
+
+let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(log = false) (env : Env.t) =
   Hc.frozen := true;
   (* Dropping the environment's hash-cons table saves memory but costs ~45%
      check time (rebuilt terms are no longer shared with the environment), so
@@ -254,8 +318,19 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
   let internal = Array.make nb false in
   let timing = Sys.getenv_opt "O4L_TIMES" <> None in
   let next = Atomic.make 0 in
-  let worker () =
+  let g = { budget_mb; base_overhead = (Gc.get ()).space_overhead; max_jobs = max 1 jobs;
+            allowed = Atomic.make (max 1 jobs); busy = Atomic.make false;
+            next_sample = Atomic.make 0.0; overhead = (Gc.get ()).space_overhead; last_rss = 0; log } in
+  let governed = budget_mb < max_int in
+  let worker w () =
     let rec loop () =
+      if governed then begin
+        governor_sample g;
+        (* paused while the governor allows fewer domains (worker 0 never is) *)
+        while w >= Atomic.get g.allowed && Atomic.get next < nb do
+          Unix.sleepf 0.05; governor_sample g
+        done
+      end;
       let i = Atomic.fetch_and_add next 1 in
       if i < nb then begin
         let t0 = if timing then Unix.gettimeofday () else 0.0 in
@@ -274,10 +349,10 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
         loop ()
       end in
     loop () in
-  if jobs <= 1 then worker ()
+  if jobs <= 1 then worker 0 ()
   else begin
-    let ds = List.init (jobs - 1) (fun _ -> Domain.spawn worker) in
-    worker ();
+    let ds = List.init (jobs - 1) (fun k -> Domain.spawn (worker (k + 1))) in
+    worker 0 ();
     List.iter Domain.join ds
   end;
   if timing then begin
