@@ -12,10 +12,20 @@ let main () =
   Arg.parse spec (fun f -> file := f) "ocaml4lean [-j N] [--stats] FILE.ndjson  (FILE may be - for stdin)";
   if !file = "" then (prerr_endline "no input file"; exit 3);
   let t0 = Unix.gettimeofday () in
-  (* Everything allocated while parsing stays live (it is the environment), so
-     major collections during parsing are pure overhead. *)
+  (* Memory policy.  The environment (about the size of the input file once
+     parsed) stays live for the whole run, and OCaml's heap settles near
+     live * (1 + space_overhead/100).  Small inputs use generous overheads,
+     which are fastest; for inputs over 1 GB (Mathlib is ~6 GB) the overheads
+     shrink and the heap is compacted after parsing, which discards the
+     parser's garbage (measured on an 827 MB export: 1.38 GB heap after
+     parsing, 0.87 GB live).  The env vars O4L_PARSE_OVERHEAD,
+     O4L_SPACE_OVERHEAD and O4L_COMPACT=0/1 override the policy;
+     O4L_DROP_TABLE=1 frees the hash-cons table after parsing (less memory,
+     much slower; not used by default). *)
+  let env_int v d = match Sys.getenv_opt v with Some x -> int_of_string x | None -> d in
+  let input_mb = if !file = "-" then 0 else (try (Unix.stat !file).st_size / 1048576 with _ -> 0) in
   let gc0 = Gc.get () in
-  Gc.set { gc0 with space_overhead = 10_000 };
+  Gc.set { gc0 with space_overhead = env_int "O4L_PARSE_OVERHEAD" (if input_mb <= 1024 then 200 else 80) };
   let env =
     try
       let ic = if !file = "-" then stdin else open_in_bin !file in
@@ -24,8 +34,22 @@ let main () =
     with
     | Kernel.Parse.Bad m -> Printf.printf "parse error: %s\n" m; exit 3
     | Sys_error m -> Printf.printf "error: %s\n" m; exit 3 in
+  (* for stdin, estimate the size from the heap *)
+  let input_mb = if !file = "-" then (Gc.quick_stat ()).heap_words * 8 / 1048576 / 2 else input_mb in
+  if !stats then begin
+    let s = Gc.quick_stat () in
+    Printf.eprintf "after parse: heap %d MB, top_heap %d MB\n%!" (s.heap_words * 8 / 1048576) (s.top_heap_words * 8 / 1048576)
+  end;
+  if env_int "O4L_COMPACT" (if input_mb > 1024 then 1 else 0) = 1 then begin
+    Gc.compact ();
+    if !stats then Printf.eprintf "after compaction: heap %d MB\n%!" ((Gc.quick_stat ()).heap_words * 8 / 1048576)
+  end;
   let t1 = Unix.gettimeofday () in
-  Gc.set { gc0 with space_overhead = (match Sys.getenv_opt "O4L_SPACE_OVERHEAD" with Some v -> int_of_string v | None -> 120) };
+  (* measured on an 827 MB export with this policy forced: overhead 25 gives a
+     peak RSS of 2.1x the input (1.77 GB) for ~30% more check time *)
+  let overhead = env_int "O4L_SPACE_OVERHEAD" (if input_mb <= 1024 then 120 else max 25 (120 * 1024 / input_mb)) in
+  if !stats then Printf.eprintf "space_overhead while checking: %d\n%!" overhead;
+  Gc.set { gc0 with space_overhead = overhead };
   if !stats then Printf.eprintf "expr table: %s\n%!" (Kernel.Expr.H.global_stats ());
   let ndecls = Kernel.Name.Tbl.length env.consts in
   let on_error i m =

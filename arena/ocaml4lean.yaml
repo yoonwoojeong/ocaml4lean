@@ -21,7 +21,9 @@ description: |
     does. Errors (unparsable input, running out of stack or memory) exit with
     code 3 and are never reported as a rejection.
 
-  Peak memory is about six times the size of the export file.
+  The parsed environment takes about as much memory as the export file. For inputs
+  over 1 GB the checker compacts the heap after parsing and lowers the GC's space
+  overhead, keeping peak memory near twice the input size.
 
   Written by Claude (Anthropic), directed by yoonwoojeong.
 url: https://github.com/yoonwoojeong/ocaml4lean

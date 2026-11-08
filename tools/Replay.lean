@@ -26,7 +26,7 @@ partial def closure (env : Environment) (todo : List Name) (acc : Std.HashMap Na
       let mut deps := c.type.getUsedConstants.toList
       if let some v := c.value? (allowOpaque := true) then deps := deps ++ v.getUsedConstants.toList
       match c with
-      | .inductInfo v => deps := deps ++ v.all ++ v.ctors ++ v.all.map (· ++ `rec)
+      | .inductInfo v => deps := deps ++ v.all ++ v.ctors ++ v.all.map (Name.str · "rec")
       | .ctorInfo v => deps := deps ++ [v.induct]
       | .recInfo v => deps := deps ++ v.all ++ (v.rules.map (·.rhs.getUsedConstants.toList)).flatten
       | .quotInfo _ => deps := deps ++ [``Quot, ``Quot.mk, ``Quot.lift, ``Quot.ind, ``Eq]

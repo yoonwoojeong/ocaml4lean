@@ -243,6 +243,10 @@ let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.res
 
 let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
   Hc.frozen := true;
+  (* Dropping the environment's hash-cons table saves memory but costs ~45%
+     check time (rebuilt terms are no longer shared with the environment), so
+     it is only done on request. *)
+  if Sys.getenv_opt "O4L_DROP_TABLE" <> None then Expr.H.drop_global ();
   let bi = builtins env in
   let nb = Array.length env.blocks in
   let errs = Array.make nb None in
