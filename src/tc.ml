@@ -82,13 +82,16 @@ let get c n = match find c n with
   | None -> fail "unknown constant '%s'" (Name.to_string n)
 
 let mk_const n = Expr.const n []
-let c_nat = lazy (mk_const N.nat)
-let c_nat_zero = lazy (mk_const N.nat_zero)
-let c_nat_succ = lazy (mk_const N.nat_succ)
-let c_bool_true = lazy (mk_const N.bool_true)
-let c_bool_false = lazy (mk_const N.bool_false)
-let c_string = lazy (mk_const N.string)
-let dontcare = lazy (mk_const N.dontcare)
+(* Built eagerly at startup (before the environment is frozen, so they are
+   shared global nodes).  These must not be [lazy]: forcing one lazy value
+   from two domains at once raises CamlinternalLazy.Undefined in OCaml 5. *)
+let c_nat = mk_const N.nat
+let c_nat_zero = mk_const N.nat_zero
+let c_nat_succ = mk_const N.nat_succ
+let c_bool_true = mk_const N.bool_true
+let c_bool_false = mk_const N.bool_false
+let c_string = mk_const N.string
+let dontcare = mk_const N.dontcare
 
 let is_sort = function Sort _ -> true | _ -> false
 let is_pi = function Pi _ -> true | _ -> false
@@ -112,8 +115,8 @@ let nat_val = function NatLit { n; _ } -> n | _ -> Z.zero
 
 let nat_lit_to_constructor = function
   | NatLit { n; _ } ->
-    if Z.equal n Z.zero then Lazy.force c_nat_zero
-    else app (Lazy.force c_nat_succ) (natlit (Z.pred n))
+    if Z.equal n Z.zero then c_nat_zero
+    else app (c_nat_succ) (natlit (Z.pred n))
   | e -> e
 
 (* decode UTF-8 into code points (invalid bytes are taken as is) *)
@@ -170,10 +173,10 @@ let rec infer_core c e infer_only : Expr.t =
       | NatLit { n; _ } ->
         if not c.bi.nat_ok then fail "Nat literal used, but Nat is not available";
         if Z.numbits n / 8 > max_nat_bytes then fail "Nat literal too large";
-        Lazy.force c_nat
+        c_nat
       | StrLit _ ->
         if not c.bi.str_ok then fail "String literal used, but String is not available";
-        Lazy.force c_string
+        c_string
       | Proj { s; idx; e = st; _ } -> infer_proj c s idx st e infer_only
       | FVar { ty; _ } -> ty
       | BVar _ -> assert false
@@ -577,7 +580,7 @@ and nat_pred c e (f : Z.t -> Z.t -> bool) =
     if not (is_nat_lit_ext a1) then None else
       let a2 = whnf c a2 in
       if not (is_nat_lit_ext a2) then None else
-        Some (if f (nat_val a1) (nat_val a2) then Lazy.force c_bool_true else Lazy.force c_bool_false)
+        Some (if f (nat_val a1) (nat_val a2) then c_bool_true else c_bool_false)
   | _ -> None
 
 and reduce_nat c e =
@@ -665,7 +668,7 @@ and is_def_eq_binding c t s =
       if not (closed tb) || not (closed sb) then begin
         let vs = match !var_s_type with Some v -> v | None -> instantiate_rev_sub st (Vec.data subst) n in
         Vec.push subst (mk_fvar vs)
-      end else Vec.push subst (Lazy.force dontcare);
+      end else Vec.push subst (dontcare);
       match t, tb, sb with
       | Lam _, Lam _, Lam _ | Pi _, Pi _, Pi _ -> go_one tb sb
       | _ -> let xs = Vec.to_array subst in is_def_eq c (instantiate_rev tb xs) (instantiate_rev sb xs)

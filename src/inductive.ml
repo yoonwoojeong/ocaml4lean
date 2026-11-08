@@ -224,8 +224,8 @@ let add_inductive_core env bi pos (overlay : cinfo Name.Tbl.t) (d : decl) (nnest
     match which_valid_ind_app t with
     | None -> fail "ill-formed inductive application"
     | Some r -> let _, args = get_app_args t in (r, Array.sub args nparams (Array.length args - nparams)) in
-  let motives = Array.make ntypes (Lazy.force dontcare) in
-  let majors = Array.make ntypes (Lazy.force dontcare) in
+  let motives = Array.make ntypes dontcare in
+  let majors = Array.make ntypes dontcare in
   let rindices = Array.make ntypes [||] in
   Array.iteri (fun d_idx t ->
       let ty = ref (whnf t.it_ty) and i = ref 0 in
