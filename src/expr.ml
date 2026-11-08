@@ -116,7 +116,7 @@ let fvar_ty = function FVar { ty; _ } -> ty | _ -> invalid_arg "fvar_ty"
 module PairTbl = Hashtbl.Make (struct
     type nonrec t = t * t
     let equal (a, b) (c, d) = a == c && b == d
-    let hash (a, b) = mix (hash a) (hash b)
+    let hash (a, b) = mix (mix 0x2545F491 (hash a)) (hash b)   (* order-dependent; see Pset.key *)
   end)
 
 let equal a b =
@@ -205,8 +205,13 @@ module Pset = struct
     { hs = Array.make cap 0; as_ = Array.make cap Emap.dummy_key; bs = Array.make cap Emap.dummy_key;
       n = 0; mask = cap - 1 }
   (* order the pair by hash so that (a, b) and (b, a) are the same key *)
+  (* [mix h x] only sees [h lxor x], so a bare [mix ha hb] would collide for
+     every two pairs with the same XOR of hashes -- common for terms that
+     differ in one argument -- and build long probe clusters.  Mixing in two
+     sequential steps keeps the pair's order (after normalising it). *)
   let key a b = let ha = hash a and hb = hash b in
-    if ha <= hb then ((mix ha hb) lor 1) land max_int else ((mix hb ha) lor 1) land max_int
+    let lo, hi = if ha <= hb then ha, hb else hb, ha in
+    ((mix (mix 0x2545F491 lo) hi) lor 1) land max_int
   let mem t a b =
     let h = key a b in
     let mask = t.mask in

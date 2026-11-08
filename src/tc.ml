@@ -37,6 +37,37 @@ end
    (decided once, see [Builtins]). *)
 type builtins = { nat_ok : bool; str_ok : bool; quot_ok : bool }
 
+(* Session caches (after sokonanoda and Pestka): a domain keeps these across
+   consecutive declarations instead of discarding them after each one.  Only
+   results that do not depend on the declaration being checked are kept:
+   inference-only types, weak head normal forms, definition unfoldings and
+   definitional-equality successes (facts about terms, true in any later
+   context: constants never change, and a domain visits blocks in increasing
+   order, so later declarations see a superset of the constants), and failure
+   records (which only gate a shortcut and never decide a result).
+   Checking-mode inference depends on the declaration's universe parameters
+   and safety, and contexts with a local overlay (inductive blocks, unsafe
+   definitions that see themselves) change what names mean: neither uses a
+   session. *)
+type session = {
+  s_infer_only : Expr.t Emap.t;
+  s_whnf_core : Expr.t Emap.t;
+  s_whnf : Expr.t Emap.t;
+  s_unfold : Expr.t Emap.t;
+  s_success : Pset.t;
+  s_failure : Pset.t;
+}
+
+let new_session () = {
+  s_infer_only = Emap.create Emap.dummy_key 4096; s_whnf_core = Emap.create Emap.dummy_key 4096;
+  s_whnf = Emap.create Emap.dummy_key 4096; s_unfold = Emap.create Emap.dummy_key 1024;
+  s_success = Pset.create 4096; s_failure = Pset.create 1024;
+}
+
+let session_entries s =
+  s.s_infer_only.Emap.n + s.s_whnf_core.Emap.n + s.s_whnf.Emap.n + s.s_unfold.Emap.n
+  + s.s_success.Pset.n + s.s_failure.Pset.n
+
 type ctx = {
   env : Env.t;
   bi : builtins;
@@ -51,18 +82,37 @@ type ctx = {
   unfold_tbl : Expr.t Emap.t;
   success : Pset.t;
   failure : Pset.t;
+  sess : session option;              (* session caches, for global keys only *)
   mutable eager : bool;
 }
 
 let max_nat_bytes = 128 * 1024 * 1024
 
-let create ?(local = Name.Tbl.create 8) ?(safety = Safe) env bi pos = {
+let create ?(local = Name.Tbl.create 8) ?(safety = Safe) ?session env bi pos = {
   env; bi; pos; local; lparams = None; safety;
   infer_tbl = Emap.create Emap.dummy_key 64; infer_only_tbl = Emap.create Emap.dummy_key 64;
   whnf_core_tbl = Emap.create Emap.dummy_key 64; whnf_tbl = Emap.create Emap.dummy_key 64;
   unfold_tbl = Emap.create Emap.dummy_key 16;
-  success = Pset.create 16; failure = Pset.create 16; eager = false;
+  success = Pset.create 16; failure = Pset.create 16;
+  sess = (if Name.Tbl.length local = 0 then session else None); eager = false;
 }
+
+(* Two-tier lookup.  A session cache only pays off with canonical keys: terms
+   built during checking are not hash-consed, so a session keyed on them would
+   deep-compare re-built copies of the same large terms from every earlier
+   declaration (measured: Init 77 s -> >18 min).  Environment terms are
+   hash-consed, so for them equality is physical identity: those keys go to
+   the session, all others to the per-declaration table. *)
+let tfind (local : Expr.t Emap.t) sel c e =
+  match c.sess with
+  | Some s when is_global e -> Emap.find (sel s) e
+  | _ -> Emap.find local e
+let tadd (local : Expr.t Emap.t) sel c e r =
+  match c.sess with
+  | Some s when is_global e -> Emap.add (sel s) e r
+  | _ -> Emap.add local e r
+let session_pairs = Sys.getenv_opt "O4L_SESSION_PAIRS" <> Some "0"
+let pglobal c t u = match c.sess with Some s when session_pairs && is_global t && is_global u -> Some s | _ -> None
 
 let find_global c n =
   match Name.Tbl.find c.env.consts n with
@@ -165,8 +215,8 @@ let instantiate_type_lparams ci ls = instantiate_lparams ci.ty ci.lparams ls
 (* ---------- inference ---------- *)
 let rec infer_core c e infer_only : Expr.t =
   if not (closed e) then fail "type checker does not support loose bound variables";
-  let tbl = if infer_only then c.infer_only_tbl else c.infer_tbl in
-  match Emap.find tbl e with
+  let find e = if infer_only then tfind c.infer_only_tbl (fun s -> s.s_infer_only) c e else Emap.find c.infer_tbl e in
+  match find e with
   | r -> r
   | exception Not_found ->
     let r = match e with
@@ -186,7 +236,7 @@ let rec infer_core c e infer_only : Expr.t =
       | Pi _ -> infer_pi c e infer_only
       | App _ -> infer_app c e infer_only
       | Let _ -> infer_let c e infer_only in
-    Emap.add tbl e r; r
+    (if infer_only then tadd c.infer_only_tbl (fun s -> s.s_infer_only) c e r else Emap.add c.infer_tbl e r); r
 
 and infer_const c n ls infer_only =
   let ci = get c n in
@@ -369,7 +419,7 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
   | FVar { v = None; _ } -> e
   | FVar { v = Some v; _ } -> whnf_core ~cheap_rec ~cheap_proj c v
   | App _ | Let _ | Proj _ ->
-    match Emap.find c.whnf_core_tbl e with
+    match tfind c.whnf_core_tbl (fun s -> s.s_whnf_core) c e with
     | r -> r
     | exception Not_found ->
       let cache = not cheap_rec && not cheap_proj in
@@ -398,7 +448,7 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
               | None -> e)
            | _ -> whnf_core ~cheap_rec ~cheap_proj c (mk_app_arr f args))
         | _ -> assert false in
-      if cache then Emap.add c.whnf_core_tbl e r;
+      if cache then tadd c.whnf_core_tbl (fun s -> s.s_whnf_core) c e r;
       r
 
 and reduce_proj_core c st sname idx =
@@ -544,11 +594,11 @@ and unfold_definition_core c e =
      | Some ci ->
        let v = match value ci with Some v -> v | None -> assert false in
        if (match ls with [] -> true | _ -> false) then Some v
-       else (match Emap.find c.unfold_tbl e with
+       else (match tfind c.unfold_tbl (fun s -> s.s_unfold) c e with
            | r -> Some r
            | exception Not_found ->
              let r = instantiate_lparams v ci.lparams ls in
-             Emap.add c.unfold_tbl e r; Some r)
+             tadd c.unfold_tbl (fun s -> s.s_unfold) c e r; Some r)
      | None -> None)
   | _ -> None
 
@@ -624,7 +674,7 @@ and whnf c e =
   | BVar _ | Sort _ | Pi _ | NatLit _ | StrLit _ -> e
   | FVar { v = None; _ } -> e
   | _ ->
-    match Emap.find c.whnf_tbl e with
+    match tfind c.whnf_tbl (fun s -> s.s_whnf) c e with
     | r -> r
     | exception Not_found ->
       let rec loop t =
@@ -636,7 +686,7 @@ and whnf c e =
           | Some t' -> loop t'
           | None -> t1 in
       let r = loop e in
-      Emap.add c.whnf_tbl e r; r
+      tadd c.whnf_tbl (fun s -> s.s_whnf) c e r; r
 
 (* ---------- definitional equality ---------- *)
 and is_def_eq_levels ls1 ls2 = match ls1, ls2 with
@@ -740,10 +790,10 @@ and is_def_eq_proof_irrel c t s =
   if not (is_prop c t_type) then -1
   else if is_def_eq c t_type (infer c s) then 1 else 0
 
-and failed_before c t s = Pset.mem c.failure t s
-and cache_failure c t s = Pset.add c.failure t s
-and succeeded_before c t s = Pset.mem c.success t s
-and cache_success c t s = Pset.add c.success t s
+and failed_before c t u = match pglobal c t u with Some s -> Pset.mem s.s_failure t u | None -> Pset.mem c.failure t u
+and cache_failure c t u = match pglobal c t u with Some s -> Pset.add s.s_failure t u | None -> Pset.add c.failure t u
+and succeeded_before c t u = match pglobal c t u with Some s -> Pset.mem s.s_success t u | None -> Pset.mem c.success t u
+and cache_success c t u = match pglobal c t u with Some s -> Pset.add s.s_success t u | None -> Pset.add c.success t u
 
 and try_unfold_proj_app c e =
   match get_app_fn e with
