@@ -26,7 +26,7 @@ description: |
   Written by Claude (Anthropic), directed by yoonwoojeong.
 url: https://github.com/yoonwoojeong/ocaml4lean
 ref: main
-rev: REV_PLACEHOLDER
+# rev: set, in the copy submitted to the arena, to the commit of `main` being submitted
 threads: 4
 # `ocaml` comes from the arena's flake; build.sh needs nothing else (no dune or opam
 # packages).
