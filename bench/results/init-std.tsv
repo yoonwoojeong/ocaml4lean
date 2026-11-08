@@ -1,0 +1,9 @@
+workload	checker	jobs	rep	wall_s	max_rss_kb	detail
+Init	official	1	1	74.44	1998124	official kernel: replayed 65890 constants in 55.413621s 
+Init	ocaml4lean	1	1	75.33	2115740	accepted 65893 declarations parse 9.954s  check 65.303s  total 75.257s  (65893 constants, 64456 blocks, 1 jobs) gc: minor 8745 MW, promoted 675 MW, major 1137 MW, minor_gcs 33378, major_gcs 25, top_heap 2049 MB 
+Init	ocaml4lean	2	1	44.81	2149428	accepted 65893 declarations parse 9.692s  check 35.040s  total 44.733s  (65893 constants, 64456 blocks, 2 jobs) gc: minor 8746 MW, promoted 681 MW, major 1144 MW, minor_gcs 23642, major_gcs 25, top_heap 2125 MB 
+Init	ocaml4lean	4	1	28.97	2222208	accepted 65893 declarations parse 9.744s  check 19.143s  total 28.887s  (65893 constants, 64456 blocks, 4 jobs) gc: minor 8746 MW, promoted 684 MW, major 1148 MW, minor_gcs 16105, major_gcs 25, top_heap 1799 MB 
+Std	official	1	1	95.73	2437048	official kernel: replayed 112716 constants in 93.141470s 
+Std	ocaml4lean	1	1	145.00	3701920	accepted 112719 declarations parse 16.218s  check 128.654s  total 144.872s  (112719 constants, 109997 blocks, 1 jobs) gc: minor 13899 MW, promoted 1151 MW, major 1871 MW, minor_gcs 53038, major_gcs 24, top_heap 3835 MB 
+Std	ocaml4lean	2	1	89.17	3814976	accepted 112719 declarations parse 16.867s  check 72.175s  total 89.042s  (112719 constants, 109997 blocks, 2 jobs) gc: minor 13900 MW, promoted 1162 MW, major 1883 MW, minor_gcs 38278, major_gcs 24, top_heap 3964 MB 
+Std	ocaml4lean	4	1	59.70	3790052	accepted 112719 declarations parse 16.949s  check 42.600s  total 59.548s  (112719 constants, 109997 blocks, 4 jobs) gc: minor 13900 MW, promoted 1169 MW, major 1891 MW, minor_gcs 26751, major_gcs 24, top_heap 3452 MB 

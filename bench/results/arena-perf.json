@@ -1,0 +1,653 @@
+[
+ {
+  "test": "perf/app-lam",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 13.146138906478882,
+   "kernel_time": 5.644654,
+   "rss_kb": 4940416
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 10.94536018371582,
+   "check_time": 10.841,
+   "rss_kb": 1592072,
+   "msg": "MAXRSS 1592072",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/args-before-unfold",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.989701747894287,
+   "kernel_time": 0.006974,
+   "rss_kb": 3626148
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.024676799774169922,
+   "check_time": 0.004,
+   "rss_kb": 24896,
+   "msg": "MAXRSS 24896",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/beta-ladder",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 5.037683725357056,
+   "kernel_time": 1.430101,
+   "rss_kb": 4016620
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 2.1496617794036865,
+   "check_time": 2.094,
+   "rss_kb": 488672,
+   "msg": "MAXRSS 488672",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/church-numerals",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 4.0542967319488525,
+   "kernel_time": 0.016409,
+   "rss_kb": 3632652
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.06943988800048828,
+   "check_time": 0.047,
+   "rss_kb": 34616,
+   "msg": "MAXRSS 34616",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/discarded-argument-match",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.9998748302459717,
+   "kernel_time": 0.064538,
+   "rss_kb": 3626036
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.12554073333740234,
+   "check_time": 0.089,
+   "rss_kb": 28300,
+   "msg": "MAXRSS 28300",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/discarded-argument",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.953662872314453,
+   "kernel_time": 0.075209,
+   "rss_kb": 3625860
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.031957387924194336,
+   "check_time": 0.015,
+   "rss_kb": 25036,
+   "msg": "MAXRSS 25036",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/folded-constant-first",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.5949277877807617,
+   "kernel_time": 0.010781,
+   "rss_kb": 3625860
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.03941202163696289,
+   "check_time": 0.016,
+   "rss_kb": 27892,
+   "msg": "MAXRSS 27892",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/folded-constant-last",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.626801013946533,
+   "kernel_time": 0.00946,
+   "rss_kb": 3627216
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.03545427322387695,
+   "check_time": 0.016,
+   "rss_kb": 27900,
+   "msg": "MAXRSS 27900",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/fueled-chain",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 1.6152458190917969,
+   "kernel_time": 0.047693,
+   "rss_kb": 2001472
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.17380046844482422,
+   "check_time": 0.137,
+   "rss_kb": 38104,
+   "msg": "MAXRSS 38104",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/grind-ring-5",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.6252334117889404,
+   "kernel_time": 2.07722,
+   "rss_kb": 2138520
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 2.290538787841797,
+   "check_time": 2.039,
+   "rss_kb": 245720,
+   "msg": "MAXRSS 245720",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/identical-nesting",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 4.227447986602783,
+   "kernel_time": 0.002526,
+   "rss_kb": 3625928
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.01891350746154785,
+   "check_time": 0.001,
+   "rss_kb": 22720,
+   "msg": "MAXRSS 22720",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/irrelevance-before-evaluation",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.8477962017059326,
+   "kernel_time": 0.001793,
+   "rss_kb": 3625968
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.021128177642822266,
+   "check_time": 0.001,
+   "rss_kb": 23428,
+   "msg": "MAXRSS 23428",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/irrelevance-refutes",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 1.538907766342163,
+   "kernel_time": 0.001137,
+   "rss_kb": 1998836
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.016933679580688477,
+   "check_time": 0.001,
+   "rss_kb": 23116,
+   "msg": "MAXRSS 23116",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/let-fold",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.9430019855499268,
+   "kernel_time": 0.015688,
+   "rss_kb": 3625920
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.03951597213745117,
+   "check_time": 0.012,
+   "rss_kb": 25508,
+   "msg": "MAXRSS 25508",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/let-ladder",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 4.295412063598633,
+   "kernel_time": 0.792471,
+   "rss_kb": 3812744
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 1.1698522567749023,
+   "check_time": 1.135,
+   "rss_kb": 269572,
+   "msg": "MAXRSS 269572",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/magma-list-deep-n21",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 5.622092247009277,
+   "kernel_time": 3.923073,
+   "rss_kb": 2592964
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 4.982706785202026,
+   "check_time": 4.908,
+   "rss_kb": 768660,
+   "msg": "MAXRSS 768660",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/magma-list-deep-n36",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 63.74415636062622,
+   "kernel_time": 61.824605,
+   "rss_kb": 10058332
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 83.90207982063293,
+   "check_time": 83.549,
+   "rss_kb": 9183456,
+   "msg": "MAXRSS 9183456",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/magma-list-pair-n21",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 35.59524440765381,
+   "kernel_time": 33.897362,
+   "rss_kb": 6051280
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 45.790118932724,
+   "check_time": 45.566,
+   "rss_kb": 5679384,
+   "msg": "MAXRSS 5679384",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/magma-list-pair-n7",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 4.350045442581177,
+   "kernel_time": 2.652324,
+   "rss_kb": 2353848
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.662081480026245,
+   "check_time": 3.583,
+   "rss_kb": 580092,
+   "msg": "MAXRSS 580092",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/magma-string-n4",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 4.960596799850464,
+   "kernel_time": 2.962834,
+   "rss_kb": 2024860
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.5110416412353516,
+   "check_time": 3.014,
+   "rss_kb": 154452,
+   "msg": "MAXRSS 154452",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/magma-string-pair-n9",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 11.694675207138062,
+   "kernel_time": 9.769784,
+   "rss_kb": 2912028
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 12.726984977722168,
+   "check_time": 12.272,
+   "rss_kb": 1352844,
+   "msg": "MAXRSS 1352844",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/proj-cheap-struct",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 1.8028218746185303,
+   "kernel_time": 0.004985,
+   "rss_kb": 1998460
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.02143120765686035,
+   "check_time": 0.005,
+   "rss_kb": 24200,
+   "msg": "MAXRSS 24200",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/proj-lazy-struct",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 1.5193943977355957,
+   "kernel_time": 0.002058,
+   "rss_kb": 1998436
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.02480769157409668,
+   "check_time": 0.002,
+   "rss_kb": 24088,
+   "msg": "MAXRSS 24088",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/proj-stuck-struct",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 1.4973118305206299,
+   "kernel_time": 0.002476,
+   "rss_kb": 1998568
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.03486132621765137,
+   "check_time": 0.003,
+   "rss_kb": 24244,
+   "msg": "MAXRSS 24244",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/prop-struct-projections",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 1.6570396423339844,
+   "kernel_time": 0.032087,
+   "rss_kb": 1998980
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.07304811477661133,
+   "check_time": 0.047,
+   "rss_kb": 28664,
+   "msg": "MAXRSS 28664",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/refute-cheap-first",
+  "expected": "reject",
+  "official": {
+   "accept": false,
+   "timeout": false,
+   "wall": 3.784349203109741,
+   "kernel_time": null,
+   "rss_kb": 3625836
+  },
+  "ocaml4lean": {
+   "accept": false,
+   "timeout": false,
+   "wall": 0.018750429153442383,
+   "check_time": 0.001,
+   "rss_kb": 23808,
+   "msg": "MAXRSS 23808",
+   "exit": 1
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/refute-cheap-last",
+  "expected": "reject",
+  "official": {
+   "accept": false,
+   "timeout": false,
+   "wall": 3.507535934448242,
+   "kernel_time": null,
+   "rss_kb": 3623984
+  },
+  "ocaml4lean": {
+   "accept": false,
+   "timeout": false,
+   "wall": 0.03617119789123535,
+   "check_time": 0.014,
+   "rss_kb": 25240,
+   "msg": "MAXRSS 25240",
+   "exit": 1
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/repeated-subproblem",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.437344789505005,
+   "kernel_time": 0.001912,
+   "rss_kb": 3625924
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.01967477798461914,
+   "check_time": 0.001,
+   "rss_kb": 23152,
+   "msg": "MAXRSS 23152",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/shared-subterm",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.3882439136505127,
+   "kernel_time": 0.021732,
+   "rss_kb": 3627100
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.04640030860900879,
+   "check_time": 0.026,
+   "rss_kb": 29800,
+   "msg": "MAXRSS 29800",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/shift-cascade",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.4534285068511963,
+   "kernel_time": 0.004805,
+   "rss_kb": 3626324
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.02545619010925293,
+   "check_time": 0.004,
+   "rss_kb": 26372,
+   "msg": "MAXRSS 26372",
+   "exit": 0
+  },
+  "ok": true
+ },
+ {
+  "test": "perf/unroll-versus-evaluate",
+  "expected": "accept",
+  "official": {
+   "accept": true,
+   "timeout": false,
+   "wall": 3.572906255722046,
+   "kernel_time": 0.002074,
+   "rss_kb": 3626432
+  },
+  "ocaml4lean": {
+   "accept": true,
+   "timeout": false,
+   "wall": 0.019320249557495117,
+   "check_time": 0.001,
+   "rss_kb": 24360,
+   "msg": "MAXRSS 24360",
+   "exit": 0
+  },
+  "ok": true
+ }
+]
