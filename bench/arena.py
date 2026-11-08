@@ -10,7 +10,7 @@ Outcomes are compared with the expected one; wall time and peak RSS are recorded
 
 usage: arena.py ARENA_DIR WORK_DIR [glob...]
 """
-import glob, json, os, re, shutil, subprocess, sys, time
+import glob, json, os, re, shutil, signal, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEAN_HOME = os.environ.get("LEAN_HOME", "/opt/lean/lean-4.35.0-linux")
@@ -24,11 +24,15 @@ def yaml_get(text, key):
 
 def timed(cmd, env=None, timeout=600):
     t0 = time.time()
+    p = subprocess.Popen(["/usr/bin/time", "-f", "MAXRSS %M"] + cmd, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
     try:
-        p = subprocess.run(["/usr/bin/time", "-f", "MAXRSS %M"] + cmd, capture_output=True, text=True,
-                           env=env, timeout=timeout)
+        out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)   # kill the checker too, not only /usr/bin/time
+        p.communicate()
         return None, time.time() - t0, 0, "timeout"
+    p.stdout, p.stderr = out, err
     dt = time.time() - t0
     m = re.search(r"MAXRSS (\d+)", p.stderr)
     return p.returncode, dt, int(m.group(1)) if m else 0, p.stdout + p.stderr
@@ -51,6 +55,7 @@ def main():
             mod = "T_" + mod
             nd = os.path.join(work, mod + ".ndjson")
             rec = {"test": name, "expected": outcome}
+            tmo = min(600, int(yaml_get(text, "timeout") or 600))
             env = dict(os.environ, LEAN_PATH=work + ":" + os.path.join(LEAN_HOME, "lib", "lean"),
                        PATH=os.path.join(LEAN_HOME, "bin") + ":" + os.environ["PATH"])
             if leanfile:
@@ -72,16 +77,16 @@ def main():
                     if r.returncode != 0:
                         rec["error"] = "export failed: " + r.stderr[-300:]
                         os.remove(nd); results.append(rec); print(json.dumps(rec)); continue
-                code, dt, rss, out = timed([LEAN, "--run", os.path.join(ROOT, "tools", "Replay.lean"), mod, "--"] + decls, env=env)
+                code, dt, rss, out = timed([LEAN, "--run", os.path.join(ROOT, "tools", "Replay.lean"), mod, "--"] + decls, env=env, timeout=tmo)
                 m = re.search(r"in ([0-9.e+-]+)s", out)
-                rec["official"] = {"accept": code == 0, "wall": dt, "kernel_time": float(m.group(1)) if m else None, "rss_kb": rss}
+                rec["official"] = {"accept": code == 0 if code is not None else None, "timeout": code is None, "wall": dt, "kernel_time": float(m.group(1)) if m else None, "rss_kb": rss}
             elif file_:
                 nd = os.path.join(arena, file_)
             else:
                 continue
-            code, dt, rss, out = timed([CHECKER, "-j", JOBS, "--stats", nd])
+            code, dt, rss, out = timed([CHECKER, "-j", JOBS, "--stats", nd], timeout=tmo)
             m = re.search(r"check ([0-9.]+)s", out)
-            rec["ocaml4lean"] = {"accept": code == 0, "wall": dt, "check_time": float(m.group(1)) if m else None,
+            rec["ocaml4lean"] = {"accept": code == 0 if code is not None else None, "timeout": code is None, "wall": dt, "check_time": float(m.group(1)) if m else None,
                                  "rss_kb": rss, "msg": out.strip().splitlines()[-1][:160] if out.strip() else "",
                                  "exit": code}
             exp_acc = {"accept": True, "reject": False}.get(outcome)
