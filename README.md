@@ -24,7 +24,9 @@ unit-like types, Nat/String literal extensions, `eagerReduce`).
   time; declarations are checked in parallel on OCaml 5 domains, and with 4 domains it
   checks `Init` in 0.35× and `Std` in 0.46× of the official kernel's time.
 
-See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark results and analysis.
+See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark results and analysis, and
+[docs/MEMORY.md](docs/MEMORY.md) for the memory engineering (diagnosis of the arena's
+Mathlib failure, measured optimization stages, governor, OxCaml evaluation).
 
 ## Build
 

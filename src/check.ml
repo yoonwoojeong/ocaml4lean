@@ -271,6 +271,7 @@ type governor = {
   busy : bool Atomic.t;            (* one worker samples at a time *)
   next_sample : float Atomic.t;
   mutable overhead : int;
+  mutable last_rss : int;          (* highest RSS seen at a sample *)
   log : bool;
 }
 
@@ -279,18 +280,28 @@ let governor_sample g =
   if now >= Atomic.get g.next_sample && Atomic.compare_and_set g.busy false true then begin
     Atomic.set g.next_sample (now +. 0.2);
     let rss = rss_mb () in
+    let heap = (Gc.quick_stat ()).heap_words * 8 / 1048576 in   (* all domains *)
+    let grew = rss > g.last_rss + 32 in
+    g.last_rss <- max g.last_rss rss;
     let a = Atomic.get g.allowed in
+    (* RSS is a high-water mark (OCaml 5 keeps freed pool memory mapped), so
+       pressure means: above budget and still growing, or the GC heap itself
+       close to the budget.  Relief is judged on the GC heap: well below the
+       budget means the memory already mapped has room to be reused. *)
+    let pressure = (rss > g.budget_mb && grew) || heap > g.budget_mb * 9 / 10 in
+    let relief = heap < g.budget_mb * 6 / 10 && not grew in
     let a', o' =
-      if rss > g.budget_mb then max 1 (a - 1), max 10 (g.overhead * 2 / 3)
-      else if rss < g.budget_mb * 3 / 4 then min g.max_jobs (a + 1), min g.base_overhead (g.overhead * 3 / 2 + 1)
+      if pressure then max 1 (a - 1), max 10 (g.overhead * 2 / 3)
+      else if relief then min g.max_jobs (a + 1), min g.base_overhead (g.overhead * 3 / 2 + 1)
       else a, g.overhead in
     if o' <> g.overhead then begin
       g.overhead <- o';
       Gc.set { (Gc.get ()) with space_overhead = o' }
     end;
     if a' <> a then Atomic.set g.allowed a';
-    if g.log && (a' <> a || rss > g.budget_mb) then
-      Printf.eprintf "memlog governor rss=%dMB budget=%dMB domains=%d space_overhead=%d\n%!" rss g.budget_mb a' g.overhead;
+    if g.log && (a' <> a || o' <> g.overhead || pressure) then
+      Printf.eprintf "memlog governor rss=%dMB heap=%dMB budget=%dMB domains=%d space_overhead=%d\n%!"
+        rss heap g.budget_mb a' g.overhead;
     Atomic.set g.busy false
   end
 
@@ -309,7 +320,7 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(log = f
   let next = Atomic.make 0 in
   let g = { budget_mb; base_overhead = (Gc.get ()).space_overhead; max_jobs = max 1 jobs;
             allowed = Atomic.make (max 1 jobs); busy = Atomic.make false;
-            next_sample = Atomic.make 0.0; overhead = (Gc.get ()).space_overhead; log } in
+            next_sample = Atomic.make 0.0; overhead = (Gc.get ()).space_overhead; last_rss = 0; log } in
   let governed = budget_mb < max_int in
   let worker w () =
     let rec loop () =
