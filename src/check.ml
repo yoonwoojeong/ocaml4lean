@@ -105,8 +105,11 @@ let same_decl what (g : cinfo) (e : cinfo) =
   let g = rename_lparams g e.lparams in
   if not (Name.equal g.name e.name && names_equal g.lparams e.lparams && g.unsafe = e.unsafe) then
     fail "exported %s '%s' does not match the derived one (name, universe parameters or safety)" what (Name.to_string e.name);
-  if not (expr_equal g.ty e.ty) then
-    fail "exported %s '%s' has a type different from the derived one" what (Name.to_string e.name);
+  if not (expr_equal g.ty e.ty) then begin
+    if Sys.getenv_opt "O4L_DEBUG" <> None then
+      Printf.eprintf "derived:  %s\nexported: %s\n" (Expr.to_string ~max:100000 g.ty) (Expr.to_string ~max:100000 e.ty);
+    fail "exported %s '%s' has a type different from the derived one" what (Name.to_string e.name)
+  end;
   if not (kind_equal g.kind e.kind) then begin
     if Sys.getenv_opt "O4L_DEBUG" <> None then begin
       let show = function
@@ -240,6 +243,10 @@ let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.res
 
 let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
   Hc.frozen := true;
+  (* Dropping the environment's hash-cons table saves memory but costs ~45%
+     check time (rebuilt terms are no longer shared with the environment), so
+     it is only done on request. *)
+  if Sys.getenv_opt "O4L_DROP_TABLE" <> None then Expr.H.drop_global ();
   let bi = builtins env in
   let nb = Array.length env.blocks in
   let errs = Array.make nb None in

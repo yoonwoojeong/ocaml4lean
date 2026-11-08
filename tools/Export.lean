@@ -109,11 +109,11 @@ def blockOf (c : ConstantInfo) : M (Array ConstantInfo) := do
       r := r.push ti
       if let .inductInfo iv := ti then
         for k in iv.ctors do ctors := ctors.push (← getC k)
-        recs := recs.push (← getC (t ++ `rec))
+        recs := recs.push (← getC (Name.str t "rec"))
     -- auxiliary recursors of nested inductives
     if let .inductInfo iv ← getC all.head! then
       for k in [1:iv.numNested + 1] do
-        recs := recs.push (← getC ((all.head! ++ `rec).appendIndexAfter k))
+        recs := recs.push (← getC (Name.str all.head! s!"rec_{k}"))
     return r ++ ctors ++ recs
   match c with
   | .inductInfo v => indBlock v.all
@@ -130,7 +130,12 @@ def namesJ (ns : List Name) : M Json := do return toJson (← ns.mapM dumpName)
 mutual
 partial def dumpConst (n : Name) : M Unit := do
   if (← get).done.contains n then return
-  let c ← getC n
+  let (env, _) ← read
+  let some c := env.find? n
+    | -- referenced but not in the environment (seen in `Lean`'s compiler
+      -- metadata); the declaration that refers to it will be rejected
+      IO.eprintln s!"warning: skipping unknown constant {n}"
+      modify fun s => { s with done := s.done.insert n }
   if c.isUnsafe then return
   let blk ← blockOf c
   for m in blk do modify fun s => { s with done := s.done.insert m.name }

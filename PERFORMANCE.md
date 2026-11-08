@@ -54,6 +54,38 @@ Selected cases from `bench/results/arena-perf.txt` (31 cases; all verdicts corre
 
 The remaining cases take under 0.15 s on both checkers.
 
+## Lessons from the first arena run
+
+The first arena run (2026-11-08) found two problems, both fixed since:
+
+* **False rejection of `cedar` and `cslib`.** Nested-inductive elimination
+  numbers its auxiliary types in the order it meets nested occurrences. Our term
+  traversal built nodes with `pi (go ty) (go b)`, and OCaml evaluates constructor
+  arguments right to left, so for types such as `Lean.Elab.InfoTree` the
+  auxiliary recursors `rec_1 …` came out in a different order than the exported
+  ones. The traversal now visits children in the kernel's order
+  (`tests/lean/NestedOrder.lean`). The whole `Lean` package (207 422 constants,
+  827 MB) is now accepted.
+* **Out of memory on Mathlib** (killed at 15.6 GB while still parsing the 5.8 GB
+  input). Measured on the 827 MB `Lean` export:
+
+  The changes: the parser's index tables no longer box each entry; the hash-cons
+  table keeps its hashes in an off-heap 32-bit array and grows at 3/4 load; and
+  for inputs over 1 GB the GC runs normally while parsing, the heap is compacted
+  after parsing (1.26 GB heap → 0.87 GB live), and the GC space overhead while
+  checking drops to 25.
+
+  | version | peak RSS | check time (4 domains) |
+  |---|---:|---:|
+  | before | 3.5 GB | 58 s |
+  | after (policy for inputs > 1 GB forced) | **1.77 GB** | 77 s |
+
+  On inputs under 1 GB the GC settings are unchanged, so speed is unchanged:
+  `Init` 1.66 GB (was 2.2 GB), `Std` 2.2 GB (was 2.6 GB). Projected to Mathlib
+  (peak ≈ 2.1× the input), the peak should be around 12 GB. Freeing the
+  hash-cons table after parsing would save little more and costs ~45% check
+  time, so it is not done.
+
 ## Comparison with nanoda, con-leche and con-ron
 
 Not measured. Building them (Rust/Lean projects from GitHub) was blocked by the

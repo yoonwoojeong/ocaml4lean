@@ -7,19 +7,25 @@ let bad fmt = Printf.ksprintf (fun s -> raise (Bad s)) fmt
 
 (* index -> value tables: dense arrays, with a hash table for far-away indices *)
 module Idx = struct
-  type 'a t = { mutable arr : 'a option array; sparse : (int, 'a) Hashtbl.t }
-  let create n = { arr = Array.make n None; sparse = Hashtbl.create 16 }
+  (* Flat arrays holding values directly (no [option] box per entry), with a
+     sentinel for "undefined"; far-away indices go to a hash table. *)
+  type 'a t = { mutable arr : 'a array; sparse : (int, 'a) Hashtbl.t; none : 'a }
+  let create none n = { arr = Array.make n none; sparse = Hashtbl.create 16; none }
   let find t i =
-    if i >= 0 && i < Array.length t.arr then t.arr.(i) else Hashtbl.find_opt t.sparse i
-  let mem t i = find t i <> None
+    if i >= 0 && i < Array.length t.arr then
+      (let v = Array.unsafe_get t.arr i in if v == t.none then None else Some v)
+    else Hashtbl.find_opt t.sparse i
+  let mem t i =
+    if i >= 0 && i < Array.length t.arr then Array.unsafe_get t.arr i != t.none
+    else Hashtbl.mem t.sparse i
   let set t i v =
     if i < 0 then Hashtbl.replace t.sparse i v
     else begin
       if i >= Array.length t.arr && i < 4 * Array.length t.arr + 1_000_000 then begin
-        let na = Array.make (max (2 * Array.length t.arr) (i + 1)) None in
+        let na = Array.make (max (3 * Array.length t.arr / 2) (i + 1)) t.none in
         Array.blit t.arr 0 na 0 (Array.length t.arr); t.arr <- na
       end;
-      if i < Array.length t.arr then t.arr.(i) <- Some v else Hashtbl.replace t.sparse i v
+      if i < Array.length t.arr then t.arr.(i) <- v else Hashtbl.replace t.sparse i v
     end
 end
 
@@ -244,7 +250,10 @@ let fast_line st (l : string) : bool =
   end
 
 let read_channel ic : Env.t =
-  let st = { names = Idx.create 100_000; levels = Idx.create 1000; exprs = Idx.create 1_000_000; fl = Fastline.create ();
+  (* sentinels: fresh values that no parsed entry can be physically equal to *)
+  let st = { names = Idx.create (Name.Str { h = 0; pre = Name.Anon; s = "<undefined>" }) 100_000;
+             levels = Idx.create (Level.Param { h = 0; n = Name.Anon }) 1000;
+             exprs = Idx.create (Expr.BVar { h = 0; i = 0; idx = -1 }) 1_000_000; fl = Fastline.create ();
              consts = Name.Tbl.create 100_000; blocks = []; nblocks = 0; dups = []; pending_quot = [] } in
   Idx.set st.names 0 Name.Anon;
   Idx.set st.levels 0 Level.zero;

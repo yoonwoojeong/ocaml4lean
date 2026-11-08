@@ -570,13 +570,18 @@ let replace (f : t -> t option) e =
     match PhysTbl.find cache e with
     | r -> r
     | exception Not_found ->
+      (* The callback may have side effects (nested-inductive elimination
+         creates auxiliary types as it meets occurrences), so children are
+         visited in Lean's order -- function before argument, domain before
+         body -- made explicit with [let], since OCaml evaluates constructor
+         arguments right to left. *)
       let r = match f e with
         | Some r -> r
         | None -> match e with
-          | App { f; a; _ } -> app (go f) (go a)
-          | Lam { ty; b; _ } -> lam (go ty) (go b)
-          | Pi { ty; b; _ } -> pi (go ty) (go b)
-          | Let { ty; v; b; _ } -> let_ (go ty) (go v) (go b)
+          | App { f; a; _ } -> let f = go f in let a = go a in app f a
+          | Lam { ty; b; _ } -> let ty = go ty in let b = go b in lam ty b
+          | Pi { ty; b; _ } -> let ty = go ty in let b = go b in pi ty b
+          | Let { ty; v; b; _ } -> let ty = go ty in let v = go v in let b = go b in let_ ty v b
           | Proj { s; idx; e; _ } -> proj s idx (go e)
           | _ -> e in
       PhysTbl.add cache e r; r in
