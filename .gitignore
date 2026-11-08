@@ -2,3 +2,5 @@ _build/
 *.ndjson
 !tests/**/*.ndjson
 bench/results/raw/
+/ocaml4lean
+_obuild/

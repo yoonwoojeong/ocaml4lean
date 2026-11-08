@@ -1,6 +1,8 @@
 (* ocaml4lean: an external checker for Lean 4 export files.
-   Exit codes: 0 accepted, 1 rejected, 2 usage/IO/parse error. *)
-let () =
+   Exit codes (as the lean-kernel-arena expects): 0 accepted, 1 rejected,
+   3 error (usage, I/O, unparsable input, internal error).  Code 2 ("declined")
+   is never used: the checker does not decline inputs. *)
+let main () =
   let jobs = ref 1 and file = ref "" and stats = ref false and quiet = ref false in
   let spec = [
     ("-j", Arg.Set_int jobs, "N  number of checking domains (default 1)");
@@ -8,7 +10,7 @@ let () =
     ("-q", Arg.Set quiet, " only print the verdict");
   ] in
   Arg.parse spec (fun f -> file := f) "ocaml4lean [-j N] [--stats] FILE.ndjson  (FILE may be - for stdin)";
-  if !file = "" then (prerr_endline "no input file"; exit 2);
+  if !file = "" then (prerr_endline "no input file"; exit 3);
   let t0 = Unix.gettimeofday () in
   (* Everything allocated while parsing stays live (it is the environment), so
      major collections during parsing are pure overhead. *)
@@ -20,8 +22,8 @@ let () =
       let env = Kernel.Parse.read_channel ic in
       if !file <> "-" then close_in ic; env
     with
-    | Kernel.Parse.Bad m -> Printf.printf "parse error: %s\n" m; exit 2
-    | Sys_error m -> Printf.printf "error: %s\n" m; exit 2 in
+    | Kernel.Parse.Bad m -> Printf.printf "parse error: %s\n" m; exit 3
+    | Sys_error m -> Printf.printf "error: %s\n" m; exit 3 in
   let t1 = Unix.gettimeofday () in
   Gc.set { gc0 with space_overhead = (match Sys.getenv_opt "O4L_SPACE_OVERHEAD" with Some v -> int_of_string v | None -> 120) };
   if !stats then Printf.eprintf "expr table: %s\n%!" (Kernel.Expr.H.global_stats ());
@@ -54,5 +56,14 @@ let () =
   end;
   match r.errors with
   | [] -> Printf.printf "accepted %d declarations\n" ndecls; exit 0
+  | (_, m) :: _ when r.internal_only ->
+    Printf.printf "error (%d blocks could not be checked): %s\n" (List.length r.errors) m; exit 3
   | (_, m) :: _ ->
     Printf.printf "rejected (%d failing blocks): %s\n" (List.length r.errors) m; exit 1
+
+(* OCaml exits with code 2 on an uncaught exception, which the arena would
+   read as "declined"; report every unexpected failure as an error instead. *)
+let () =
+  try main () with
+  | Stdlib.Exit -> exit 3
+  | e -> Printf.printf "internal error: %s\n%!" (Printexc.to_string e); exit 3

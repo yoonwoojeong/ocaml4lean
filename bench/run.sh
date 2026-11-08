@@ -14,7 +14,7 @@ LEAN_HOME=${LEAN_HOME:-/opt/lean/lean-4.35.0-linux}
 REPS=${REPS:-1}
 export PATH=$LEAN_HOME/bin:$PATH
 mkdir -p "$WORK"
-CHK=$ROOT/_build/default/bin/main.exe
+CHK=${CHECKER:-$ROOT/ocaml4lean}   # built by ./build.sh
 OUT=$WORK/results.tsv
 echo -e "workload\tchecker\tjobs\trep\twall_s\tmax_rss_kb\tdetail" > "$OUT"
 for m in $MODS; do

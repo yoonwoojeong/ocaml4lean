@@ -138,11 +138,18 @@ let check_ind_block env bi pos types ctors recs =
       | _ -> assert false) types in
   let d = { d_lparams = first.lparams; d_nparams = nparams; d_types; d_unsafe = first.unsafe } in
   let g = Inductive.add_inductive env bi pos d in
-  let match_lists what gen exp =
+  (* Exporters may list the members of a block in any order (lean4export
+     collects recursors in a name set), so they are matched by name; every
+     exported member must correspond to exactly one derived one. *)
+  let match_lists what (gen : cinfo list) (exp : cinfo list) =
     if List.length gen <> List.length exp then
       fail "inductive block of '%s': expected %d %s, export has %d" (Name.to_string first.name)
         (List.length gen) what (List.length exp);
-    List.iter2 (fun g e -> same_decl what g e) gen exp in
+    List.iter (fun (e : cinfo) ->
+        match List.filter (fun (g : cinfo) -> Name.equal g.name e.name) gen with
+        | [g] -> same_decl what g e
+        | _ -> fail "exported %s '%s' is not derived from its inductive block" what (Name.to_string e.name))
+      exp in
   match_lists "types" g.g_types types;
   match_lists "constructors" g.g_ctors ctors;
   match_lists "recursors" g.g_recs recs
@@ -226,7 +233,8 @@ let builtins (env : Env.t) =
   { nat_ok; str_ok; quot_ok = true }
 
 (* ---------------------------------------------------------------- driver *)
-type result = { errors : (int * string) list; checked : int }
+type result = { errors : (int * string) list; checked : int; internal_only : bool }
+(* [internal_only]: every failure was an internal error (no kernel verdict) *)
 
 let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.reset_local ()
 
@@ -236,6 +244,7 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
   let nb = Array.length env.blocks in
   let errs = Array.make nb None in
   let times = Array.make nb 0.0 in
+  let internal = Array.make nb false in
   let timing = Sys.getenv_opt "O4L_TIMES" <> None in
   let next = Atomic.make 0 in
   let worker () =
@@ -245,10 +254,13 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
         let t0 = if timing then Unix.gettimeofday () else 0.0 in
         (try check_block env bi i env.blocks.(i) with
          | Kernel_error m -> errs.(i) <- Some m
-         | Stack_overflow -> errs.(i) <- Some "stack overflow"
-         | Out_of_memory -> errs.(i) <- Some "out of memory"
-         | Not_found -> errs.(i) <- Some "internal error (Not_found)"
-         | Invalid_argument m | Failure m -> errs.(i) <- Some ("internal error: " ^ m));
+         | e ->
+           (* not a verdict about the input: a resource limit or a bug *)
+           let m = match e with
+             | Stack_overflow -> "stack overflow" | Out_of_memory -> "out of memory"
+             | e -> Printexc.to_string e in
+           internal.(i) <- true;
+           errs.(i) <- Some ("internal error: " ^ m));
         if timing then times.(i) <- Unix.gettimeofday () -. t0;
         (match errs.(i) with Some m -> on_error i m | None -> ());
         reset_scratch ();
@@ -274,4 +286,6 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
   let errors = ref [] in
   for i = nb - 1 downto 0 do match errs.(i) with Some m -> errors := (i, m) :: !errors | None -> () done;
   let errors = List.map (fun n -> (-1, "duplicate declaration '" ^ Name.to_string n ^ "'")) env.dups @ !errors in
-  { errors; checked = nb }
+  let internal_only = errors <> [] && env.dups = [] &&
+                      Array.for_all2 (fun e int -> e = None || int) errs internal in
+  { errors; checked = nb; internal_only }
