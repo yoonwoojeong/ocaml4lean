@@ -44,11 +44,11 @@ type ctx = {
   local : cinfo Name.Tbl.t;           (* constants of the block being checked *)
   mutable lparams : Name.t list option;        (* universe parameters in scope *)
   safety : safety;
-  infer_tbl : Expr.t Tbl.t;
-  infer_only_tbl : Expr.t Tbl.t;
-  whnf_core_tbl : Expr.t Tbl.t;
-  whnf_tbl : Expr.t Tbl.t;
-  unfold_tbl : Expr.t Tbl.t;
+  infer_tbl : Expr.t Emap.t;
+  infer_only_tbl : Expr.t Emap.t;
+  whnf_core_tbl : Expr.t Emap.t;
+  whnf_tbl : Expr.t Emap.t;
+  unfold_tbl : Expr.t Emap.t;
   success : unit PTbl.t;
   failure : unit PTbl.t;
   mutable eager : bool;
@@ -58,8 +58,9 @@ let max_nat_bytes = 128 * 1024 * 1024
 
 let create ?(local = Name.Tbl.create 8) ?(safety = Safe) env bi pos = {
   env; bi; pos; local; lparams = None; safety;
-  infer_tbl = Tbl.create 1024; infer_only_tbl = Tbl.create 1024;
-  whnf_core_tbl = Tbl.create 1024; whnf_tbl = Tbl.create 1024; unfold_tbl = Tbl.create 64;
+  infer_tbl = Emap.create Emap.dummy_key 64; infer_only_tbl = Emap.create Emap.dummy_key 64;
+  whnf_core_tbl = Emap.create Emap.dummy_key 64; whnf_tbl = Emap.create Emap.dummy_key 64;
+  unfold_tbl = Emap.create Emap.dummy_key 16;
   success = PTbl.create 256; failure = PTbl.create 256; eager = false;
 }
 
@@ -162,7 +163,7 @@ let instantiate_type_lparams ci ls = instantiate_lparams ci.ty ci.lparams ls
 let rec infer_core c e infer_only : Expr.t =
   if not (closed e) then fail "type checker does not support loose bound variables";
   let tbl = if infer_only then c.infer_only_tbl else c.infer_tbl in
-  match Tbl.find tbl e with
+  match Emap.find tbl e with
   | r -> r
   | exception Not_found ->
     let r = match e with
@@ -182,7 +183,7 @@ let rec infer_core c e infer_only : Expr.t =
       | Pi _ -> infer_pi c e infer_only
       | App _ -> infer_app c e infer_only
       | Let _ -> infer_let c e infer_only in
-    Tbl.add tbl e r; r
+    Emap.add tbl e r; r
 
 and infer_const c n ls infer_only =
   let ci = get c n in
@@ -365,7 +366,7 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
   | FVar { v = None; _ } -> e
   | FVar { v = Some v; _ } -> whnf_core ~cheap_rec ~cheap_proj c v
   | App _ | Let _ | Proj _ ->
-    match Tbl.find c.whnf_core_tbl e with
+    match Emap.find c.whnf_core_tbl e with
     | r -> r
     | exception Not_found ->
       let cache = not cheap_rec && not cheap_proj in
@@ -394,7 +395,7 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
               | None -> e)
            | _ -> whnf_core ~cheap_rec ~cheap_proj c (mk_app_arr f args))
         | _ -> assert false in
-      if cache then Tbl.add c.whnf_core_tbl e r;
+      if cache then Emap.add c.whnf_core_tbl e r;
       r
 
 and reduce_proj_core c st sname idx =
@@ -540,11 +541,11 @@ and unfold_definition_core c e =
      | Some ci ->
        let v = match value ci with Some v -> v | None -> assert false in
        if (match ls with [] -> true | _ -> false) then Some v
-       else (match Tbl.find c.unfold_tbl e with
+       else (match Emap.find c.unfold_tbl e with
            | r -> Some r
            | exception Not_found ->
              let r = instantiate_lparams v ci.lparams ls in
-             Tbl.add c.unfold_tbl e r; Some r)
+             Emap.add c.unfold_tbl e r; Some r)
      | None -> None)
   | _ -> None
 
@@ -620,7 +621,7 @@ and whnf c e =
   | BVar _ | Sort _ | Pi _ | NatLit _ | StrLit _ -> e
   | FVar { v = None; _ } -> e
   | _ ->
-    match Tbl.find c.whnf_tbl e with
+    match Emap.find c.whnf_tbl e with
     | r -> r
     | exception Not_found ->
       let rec loop t =
@@ -632,7 +633,7 @@ and whnf c e =
           | Some t' -> loop t'
           | None -> t1 in
       let r = loop e in
-      Tbl.add c.whnf_tbl e r; r
+      Emap.add c.whnf_tbl e r; r
 
 (* ---------- definitional equality ---------- *)
 and is_def_eq_levels ls1 ls2 = match ls1, ls2 with

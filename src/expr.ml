@@ -5,7 +5,8 @@
 
    [i] packs cached data:  bit 0 = has free variables,  bit 1 = has universe
    parameters,  bit 2 = node lives in the global hash-cons tier,
-   bits 3.. = loose bound variable range (1 + max loose index). *)
+   bits 3..10 = tree size (saturating at 255),
+   bits 11.. = loose bound variable range (1 + max loose index). *)
 
 type t =
   | BVar of { h : int; i : int; idx : int }
@@ -20,21 +21,17 @@ type t =
   | StrLit of { h : int; i : int; s : string }
   | Proj of { h : int; i : int; s : Name.t; idx : int; e : t }
 
-let hash = function
-  | BVar { h; _ } | FVar { h; _ } | Sort { h; _ } | Const { h; _ } | App { h; _ }
-  | Lam { h; _ } | Pi { h; _ } | Let { h; _ } | NatLit { h; _ } | StrLit { h; _ }
-  | Proj { h; _ } -> h
+(* Every constructor is an inline record whose first two fields are [h] and
+   [i], so they can be read without dispatching on the constructor. *)
+let hash (e : t) : int = Obj.obj (Obj.field (Obj.repr e) 0)
+let info (e : t) : int = Obj.obj (Obj.field (Obj.repr e) 1)
 
-let info = function
-  | BVar { i; _ } | FVar { i; _ } | Sort { i; _ } | Const { i; _ } | App { i; _ }
-  | Lam { i; _ } | Pi { i; _ } | Let { i; _ } | NatLit { i; _ } | StrLit { i; _ }
-  | Proj { i; _ } -> i
-
-let lbr e = info e lsr 3
+let lbr e = info e lsr 11
+let size e = (info e lsr 3) land 255
 let has_fvar e = info e land 1 <> 0
 let has_lparam e = info e land 2 <> 0
 let is_global e = info e land 4 <> 0
-let closed e = info e < 8                      (* no loose bvars *)
+let closed e = info e < 2048                   (* no loose bvars *)
 
 module H = Hc.Make (struct
     type nonrec t = t
@@ -62,10 +59,12 @@ module H = Hc.Make (struct
 
 let mix = Hc.mix
 let gbit () = if !Hc.frozen then 0 else 4
-let mk_info ~fv ~lp ~lbr = (lbr lsl 3) lor (if fv then 1 else 0) lor (if lp then 2 else 0) lor gbit ()
-let union a b = (max (a lsr 3) (b lsr 3) lsl 3) lor ((a lor b) land 3) lor gbit ()
+let mk_info ~fv ~lp ~lbr = (lbr lsl 11) lor 8 lor (if fv then 1 else 0) lor (if lp then 2 else 0) lor gbit ()
+let union a b =
+  let sz = min 255 (((a lsr 3) land 255) + ((b lsr 3) land 255) + 1) in
+  (max (a lsr 11) (b lsr 11) lsl 11) lor (sz lsl 3) lor ((a lor b) land 3) lor gbit ()
 (* info of a binder body: loose range decreases by one *)
-let under i = let r = i lsr 3 in ((if r > 0 then r - 1 else 0) lsl 3) lor (i land 3)
+let under i = let r = i lsr 11 in ((if r > 0 then r - 1 else 0) lsl 11) lor (i land 2043)
 let g2 a b = info a land info b land 4 <> 0
 let g3 a b c = info a land info b land info c land 4 <> 0
 
@@ -86,8 +85,8 @@ let let_ ty v b =
   H.intern_g (g3 ty v b)
     (Let { h = mix (mix (mix 131 (hash ty)) (hash v)) (hash b);
            i = union (union (info ty) (info v)) (under (info b)); ty; v; b })
-let natlit n = H.intern_g true (NatLit { h = mix 137 (Z.hash n); i = gbit (); n })
-let strlit s = H.intern_g true (StrLit { h = mix 139 (Hashtbl.hash s); i = gbit (); s })
+let natlit n = H.intern_g true (NatLit { h = mix 137 (Z.hash n); i = 8 lor gbit (); n })
+let strlit s = H.intern_g true (StrLit { h = mix 139 (Hashtbl.hash s); i = 8 lor gbit (); s })
 let proj s idx e =
   H.intern_g (is_global e) (Proj { h = mix (mix (mix 149 (Name.hash s)) idx) (hash e); i = (info e land (lnot 4)) lor gbit (); s; idx; e })
 
@@ -97,7 +96,7 @@ let mk_fvar ?v ty =
   let c = Domain.DLS.get fv_counter in
   incr c;
   let id = !c in
-  FVar { h = mix 151 id; i = 1; id; ty; v }
+  FVar { h = mix 151 id; i = 9; id; ty; v }
 
 let fvar_ty = function FVar { ty; _ } -> ty | _ -> invalid_arg "fvar_ty"
 
@@ -148,6 +147,46 @@ let equal a b =
       | _ -> false in
     shallow a b))
 
+(* Open-addressing map keyed by expressions (structural equality), storing
+   hashes inline so that probing compares ints before calling [equal]. *)
+type expr = t
+module Emap = struct
+  type 'a t = { mutable hs : int array; mutable ks : expr array; mutable vs : 'a array;
+                mutable n : int; mutable mask : int; dk : expr; dv : 'a }
+  let dummy_key = BVar { h = 0; i = 0; idx = 0 }
+  let create dv cap =
+    let cap = let c = ref 16 in while !c < 2 * cap do c := 2 * !c done; !c in
+    { hs = Array.make cap 0; ks = Array.make cap dummy_key; vs = Array.make cap dv; n = 0; mask = cap - 1;
+      dk = dummy_key; dv }
+  let key h = (h lor 1) land max_int
+  let find t (k : expr) =
+    let h = key (hash k) in
+    let hs = t.hs and mask = t.mask in
+    let rec go i =
+      let x = Array.unsafe_get hs i in
+      if x = 0 then raise Not_found
+      else if x = h && equal (Array.unsafe_get t.ks i) k then Array.unsafe_get t.vs i
+      else go ((i + 1) land mask) in
+    go (h land mask)
+  let insert_raw hs ks vs mask h k v =
+    let rec go i =
+      if Array.unsafe_get hs i = 0 then (Array.unsafe_set hs i h; Array.unsafe_set ks i k; Array.unsafe_set vs i v)
+      else go ((i + 1) land mask) in
+    go (h land mask)
+  let grow t =
+    let cap = 2 * (t.mask + 1) in
+    let hs = Array.make cap 0 and ks = Array.make cap t.dk and vs = Array.make cap t.dv in
+    for i = 0 to t.mask do
+      let h = t.hs.(i) in if h <> 0 then insert_raw hs ks vs (cap - 1) h t.ks.(i) t.vs.(i)
+    done;
+    t.hs <- hs; t.ks <- ks; t.vs <- vs; t.mask <- cap - 1
+  (* add without checking for an existing binding (callers add after a miss) *)
+  let add t k v =
+    if 2 * (t.n + 1) > t.mask + 1 then grow t;
+    insert_raw t.hs t.ks t.vs t.mask (key (hash k)) k v;
+    t.n <- t.n + 1
+end
+
 (* ---------- application spines ---------- *)
 let rec get_app_fn = function App { f; _ } -> get_app_fn f | e -> e
 let rec get_app_num_args e = match e with App { f; _ } -> 1 + get_app_num_args f | _ -> 0
@@ -178,39 +217,76 @@ module Tbl2 = Hashtbl.Make (struct
     let hash (a, i) = mix (hash a) i
   end)
 
-(* Lossy, direct-mapped memo table keyed by (node, offset), one per domain and
-   traversal kind.  Entries are invalidated in O(1) by bumping a generation
-   counter, so starting a traversal allocates nothing.  Being lossy only costs
-   recomputation: results never depend on whether an entry is present. *)
+(* Exact memo tables keyed by (node identity, binder offset), one per domain
+   and traversal kind, reused across calls: entries live in flat arrays (no
+   per-entry allocation, hence no promotion of cache cells by the GC), and a
+   list of used slots makes clearing proportional to the previous use. *)
 module Memo = struct
-  let bits = 14
-  let size = 1 lsl bits
-  type m = { ks : t array; offs : int array; gens : int array; vs : t array; mutable gen : int }
+  type m = { mutable hs : int array; mutable ks : t array; mutable offs : int array; mutable vs : t array;
+             mutable n : int; mutable mask : int; mutable used : int array }
   let dummy = BVar { h = 0; i = 0; idx = 0 }
-  let create () = { ks = Array.make size dummy; offs = Array.make size 0; gens = Array.make size 0;
-                    vs = Array.make size dummy; gen = 0 }
-  let start m = m.gen <- m.gen + 1
-  let slot e off = (mix (hash e) off) land (size - 1)
+  let init_cap = 1024
+  let create () = { hs = Array.make init_cap 0; ks = Array.make init_cap dummy; offs = Array.make init_cap 0;
+                    vs = Array.make init_cap dummy; n = 0; mask = init_cap - 1; used = Array.make (init_cap / 2) 0 }
+  let clear m =
+    if m.n > 0 then begin
+      if m.mask + 1 > (1 lsl 16) then begin
+        m.hs <- Array.make init_cap 0; m.ks <- Array.make init_cap dummy; m.offs <- Array.make init_cap 0;
+        m.vs <- Array.make init_cap dummy; m.mask <- init_cap - 1; m.used <- Array.make (init_cap / 2) 0
+      end else
+        for k = 0 to m.n - 1 do
+          let i = Array.unsafe_get m.used k in
+          Array.unsafe_set m.hs i 0; Array.unsafe_set m.ks i dummy; Array.unsafe_set m.vs i dummy
+        done;
+      m.n <- 0
+    end
+  let key e off = ((mix (hash e) off) lor 1) land max_int
   let find m e off =
-    let i = slot e off in
-    if Array.unsafe_get m.gens i = m.gen && Array.unsafe_get m.ks i == e && Array.unsafe_get m.offs i = off
-    then Array.unsafe_get m.vs i else raise Not_found
+    let h = key e off in
+    let mask = m.mask in
+    let rec go i =
+      let x = Array.unsafe_get m.hs i in
+      if x = 0 then raise Not_found
+      else if x = h && Array.unsafe_get m.ks i == e && Array.unsafe_get m.offs i = off then Array.unsafe_get m.vs i
+      else go ((i + 1) land mask) in
+    go (h land mask)
+  let rec slot hs mask h i = if Array.unsafe_get hs i = 0 then i else slot hs mask h ((i + 1) land mask)
+  let grow m =
+    let cap = 2 * (m.mask + 1) in
+    let mask = cap - 1 in
+    let hs = Array.make cap 0 and ks = Array.make cap dummy and offs = Array.make cap 0 and vs = Array.make cap dummy in
+    let used = Array.make (cap / 2) 0 in
+    for k = 0 to m.n - 1 do
+      let i = m.used.(k) in
+      let h = m.hs.(i) in
+      let j = slot hs mask h (h land mask) in
+      hs.(j) <- h; ks.(j) <- m.ks.(i); offs.(j) <- m.offs.(i); vs.(j) <- m.vs.(i); used.(k) <- j
+    done;
+    m.hs <- hs; m.ks <- ks; m.offs <- offs; m.vs <- vs; m.mask <- mask; m.used <- used
   let add m e off v =
-    let i = slot e off in
-    Array.unsafe_set m.gens i m.gen; Array.unsafe_set m.ks i e;
-    Array.unsafe_set m.offs i off; Array.unsafe_set m.vs i v
-  (* Generations make the arrays retain dead nodes only up to [size] entries. *)
-  let key = Domain.DLS.new_key (fun () -> Array.init 6 (fun _ -> create ()))
-  let get k = let m = (Domain.DLS.get key).(k) in start m; m
+    if 2 * (m.n + 1) > m.mask + 1 then grow m;
+    let h = key e off in
+    let j = slot m.hs m.mask h (h land m.mask) in
+    Array.unsafe_set m.hs j h; Array.unsafe_set m.ks j e; Array.unsafe_set m.offs j off; Array.unsafe_set m.vs j v;
+    Array.unsafe_set m.used m.n j;
+    m.n <- m.n + 1
+  let key_dls = Domain.DLS.new_key (fun () -> Array.init 6 (fun _ -> create ()))
+  (* traversal kinds: 0 lift, 1 lower, 2 instantiate, 3 abstract, 4 lparams *)
+  let get k = let m = (Domain.DLS.get key_dls).(k) in clear m; m
 end
+
+(* Only subterms of at least this (tree) size are memoised: smaller ones are
+   cheaper to rebuild than to look up, and exponential blow-up through DAG
+   sharing can only come from large shared subterms. *)
+let memo_min = (match Sys.getenv_opt "O4L_MEMO_MIN" with Some v -> int_of_string v | None -> 32)
 
 (* lift loose bvars >= s by d *)
 let lift_loose e s d =
   if d = 0 || lbr e <= s then e else begin
-    let cache = Tbl2.create 16 in
+    let cache = Memo.get 0 in
     let rec go e off =
       if lbr e <= s + off then e else
-        match Tbl2.find cache (e, off) with
+        match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
         | r -> r
         | exception Not_found ->
           let r = match e with
@@ -221,17 +297,17 @@ let lift_loose e s d =
             | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
             | Proj { s; idx; e; _ } -> proj s idx (go e off)
             | _ -> e in
-          Tbl2.add cache (e, off) r; r in
+          if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
 (* lower loose bvars >= s by d (caller guarantees no bvar in [s-d, s) occurs) *)
 let lower_loose e s d =
   if d = 0 || lbr e <= s then e else begin
-    let cache = Tbl2.create 16 in
+    let cache = Memo.get 1 in
     let rec go e off =
       if lbr e <= s + off then e else
-        match Tbl2.find cache (e, off) with
+        match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
         | r -> r
         | exception Not_found ->
           let r = match e with
@@ -242,7 +318,7 @@ let lower_loose e s d =
             | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
             | Proj { s; idx; e; _ } -> proj s idx (go e off)
             | _ -> e in
-          Tbl2.add cache (e, off) r; r in
+          if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
@@ -251,7 +327,7 @@ let lower_loose e s d =
    [subst k] = arr.(base - k) if [rev] else arr.(base + k). *)
 let instantiate_core e n (arr : t array) base rev =
   if closed e || n = 0 then e else begin
-    let cache = Tbl2.create 32 in
+    let cache = Memo.get 2 in
     let get k = if rev then Array.unsafe_get arr (base - k) else Array.unsafe_get arr (base + k) in
     let rec go e off =
       if lbr e <= off then e else
@@ -260,7 +336,7 @@ let instantiate_core e n (arr : t array) base rev =
           let k = idx - off in
           if k < n then lift_loose (get k) 0 off else bvar (idx - n)
         | _ ->
-          match Tbl2.find cache (e, off) with
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
@@ -270,7 +346,7 @@ let instantiate_core e n (arr : t array) base rev =
               | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
               | Proj { s; idx; e; _ } -> proj s idx (go e off)
               | _ -> e in
-            Tbl2.add cache (e, off) r; r in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
@@ -279,13 +355,13 @@ let instantiate_gen e n (get : int -> t) = instantiate_core e n (Array.init n ge
 (* bvar 0 := v *)
 let instantiate1 e v =
   if closed e then e else begin
-    let cache = Tbl2.create 32 in
+    let cache = Memo.get 2 in
     let rec go e off =
       if lbr e <= off then e else
         match e with
         | BVar { idx; _ } -> if idx = off then lift_loose v 0 off else bvar (idx - 1)
         | _ ->
-          match Tbl2.find cache (e, off) with
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
@@ -295,7 +371,7 @@ let instantiate1 e v =
               | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
               | Proj { s; idx; e; _ } -> proj s idx (go e off)
               | _ -> e in
-            Tbl2.add cache (e, off) r; r in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
@@ -312,7 +388,7 @@ let instantiate_args e (args : t array) lo hi = instantiate_core e (hi - lo) arg
 (* abstract fvars xs.(0..n-1): fvar xs.(j) becomes bvar (off + n - 1 - j) *)
 let abstract e (xs : t array) n =
   if not (has_fvar e) || n = 0 then e else begin
-    let cache = Tbl2.create 32 in
+    let cache = Memo.get 3 in
     let find_idx id =
       let rec find j = if j < 0 then -1 else
           (match Array.unsafe_get xs j with FVar x when x.id = id -> j | _ -> find (j - 1)) in
@@ -323,7 +399,7 @@ let abstract e (xs : t array) n =
         | FVar { id; _ } ->
           let j = find_idx id in if j < 0 then e else bvar (off + n - 1 - j)
         | _ ->
-          match Tbl2.find cache (e, off) with
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
@@ -333,7 +409,7 @@ let abstract e (xs : t array) n =
               | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
               | Proj { s; idx; e; _ } -> proj s idx (go e off)
               | _ -> e in
-            Tbl2.add cache (e, off) r; r in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
@@ -383,11 +459,11 @@ let mk_lambda_l xs b = mk_lambda (Array.of_list xs) b
 (* ---------- universe parameter instantiation ---------- *)
 let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
   if (match ps with [] -> true | _ -> false) || not (has_lparam e) then e else begin
-    let cache = Tbl2.create 64 in
+    let cache = Memo.get 4 in
     let lv l = Level.instantiate ps ls l in
     let rec go e =
       if not (has_lparam e) then e else
-        match Tbl2.find cache (e, 0) with
+        match (if size e < memo_min then raise Not_found else Memo.find cache e 0) with
         | r -> r
         | exception Not_found ->
           let r = match e with
@@ -399,7 +475,7 @@ let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
             | Let { ty; v; b; _ } -> let_ (go ty) (go v) (go b)
             | Proj { s; idx; e; _ } -> proj s idx (go e)
             | _ -> e in
-          Tbl2.add cache (e, 0) r; r in
+          if size e >= memo_min then Memo.add cache e 0 r; r in
     go e
   end
 
