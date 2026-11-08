@@ -3,28 +3,36 @@
    influence on type checking, and dropping them makes alpha-equivalent terms
    physically equal.
 
-   [i] packs cached data:  bit 0 = has free variables,  bit 1 = has universe
+   The cached info packs:  bit 0 = has free variables,  bit 1 = has universe
    parameters,  bit 2 = node lives in the global hash-cons tier,
    bits 3..10 = tree size (saturating at 255),
    bits 11.. = loose bound variable range (1 + max loose index). *)
 
 type t =
-  | BVar of { h : int; i : int; idx : int }
-  | FVar of { h : int; i : int; id : int; ty : t; v : t option }
-  | Sort of { h : int; i : int; l : Level.t }
-  | Const of { h : int; i : int; n : Name.t; ls : Level.t list }
-  | App of { h : int; i : int; f : t; a : t }
-  | Lam of { h : int; i : int; ty : t; b : t }
-  | Pi of { h : int; i : int; ty : t; b : t }
-  | Let of { h : int; i : int; ty : t; v : t; b : t }
-  | NatLit of { h : int; i : int; n : Z.t }
-  | StrLit of { h : int; i : int; s : string }
-  | Proj of { h : int; i : int; s : Name.t; idx : int; e : t }
+  | BVar of { hi : int; idx : int }
+  | FVar of { hi : int; id : int; ty : t; v : t option }
+  | Sort of { hi : int; l : Level.t }
+  | Const of { hi : int; n : Name.t; ls : Level.t list }
+  | App of { hi : int; f : t; a : t }
+  | Lam of { hi : int; ty : t; b : t }
+  | Pi of { hi : int; ty : t; b : t }
+  | Let of { hi : int; ty : t; v : t; b : t }
+  | NatLit of { hi : int; n : Z.t }
+  | StrLit of { hi : int; s : string }
+  | Proj of { hi : int; s : Name.t; idx : int; e : t }
 
-(* Every constructor is an inline record whose first two fields are [h] and
-   [i], so they can be read without dispatching on the constructor. *)
-let hash (e : t) : int = Obj.obj (Obj.field (Obj.repr e) 0)
-let info (e : t) : int = Obj.obj (Obj.field (Obj.repr e) 1)
+(* Every constructor is an inline record whose first field [hi] packs the
+   31-bit structural hash (low bits) and the 32-bit cached info (high bits), so
+   both are read without dispatching on the constructor, and each node needs
+   one header word less (App/Lam/Pi: 4 words instead of 5). *)
+let hash (e : t) : int = (Obj.obj (Obj.field (Obj.repr e) 0) : int) land 0x7FFFFFFF
+let info (e : t) : int = (Obj.obj (Obj.field (Obj.repr e) 0) : int) lsr 31
+(* The info word is 32 bits: lbr (bits 11..31) must stay below 2^21.  Loose
+   bound variables are bounded by binder depth; a term needing more is refused
+   (an internal error, never a verdict) rather than its range truncated, which
+   could make an open term look closed. *)
+exception Too_deep
+let pack h i = if i lsr 32 <> 0 then raise Too_deep else (i lsl 31) lor (h land 0x7FFFFFFF)
 
 let lbr e = info e lsr 11
 let size e = (info e lsr 3) land 255
@@ -54,7 +62,7 @@ module H = Hc.Make (struct
       | Proj x, Proj y -> x.s == y.s && x.idx = y.idx && x.e == y.e
       | _ -> false
     let hash = hash
-    let dummy = BVar { h = 0; i = 0; idx = 0 }
+    let dummy = BVar { hi = 0; idx = 0 }
   end)
 
 let mix = Hc.mix
@@ -68,27 +76,27 @@ let under i = let r = i lsr 11 in ((if r > 0 then r - 1 else 0) lsl 11) lor (i l
 let g2 a b = info a land info b land 4 <> 0
 let g3 a b c = info a land info b land info c land 4 <> 0
 
-let bvar idx = H.intern_g true (BVar { h = mix 101 idx; i = mk_info ~fv:false ~lp:false ~lbr:(idx + 1); idx })
-let sort l = H.intern_g true (Sort { h = mix 103 (Level.hash l); i = mk_info ~fv:false ~lp:(Level.has_param l) ~lbr:0; l })
+let bvar idx = H.intern_g true (BVar { hi = pack (mix 101 idx) (mk_info ~fv:false ~lp:false ~lbr:(idx + 1)); idx })
+let sort l = H.intern_g true (Sort { hi = pack (mix 103 (Level.hash l)) (mk_info ~fv:false ~lp:(Level.has_param l) ~lbr:0); l })
 let const n ls =
   let h = List.fold_left (fun h l -> mix h (Level.hash l)) (mix 107 (Name.hash n)) ls in
-  H.intern_g true (Const { h; i = mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0; n; ls })
+  H.intern_g true (Const { hi = pack h (mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0); n; ls })
 (* After parsing, new nodes are shared only with the (frozen) environment tier;
    see Hc.intern_g.  A node can only be in that tier if all its children are. *)
 let app f a =
-  H.intern_g (g2 f a) (App { h = mix (mix 109 (hash f)) (hash a); i = union (info f) (info a); f; a })
+  H.intern_g (g2 f a) (App { hi = pack (mix (mix 109 (hash f)) (hash a)) (union (info f) (info a)); f; a })
 let lam ty b =
-  H.intern_g (g2 ty b) (Lam { h = mix (mix 113 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
+  H.intern_g (g2 ty b) (Lam { hi = pack (mix (mix 113 (hash ty)) (hash b)) (union (info ty) (under (info b))); ty; b })
 let pi ty b =
-  H.intern_g (g2 ty b) (Pi { h = mix (mix 127 (hash ty)) (hash b); i = union (info ty) (under (info b)); ty; b })
+  H.intern_g (g2 ty b) (Pi { hi = pack (mix (mix 127 (hash ty)) (hash b)) (union (info ty) (under (info b))); ty; b })
 let let_ ty v b =
   H.intern_g (g3 ty v b)
-    (Let { h = mix (mix (mix 131 (hash ty)) (hash v)) (hash b);
-           i = union (union (info ty) (info v)) (under (info b)); ty; v; b })
-let natlit n = H.intern_g true (NatLit { h = mix 137 (Z.hash n); i = 8 lor gbit (); n })
-let strlit s = H.intern_g true (StrLit { h = mix 139 (Hashtbl.hash s); i = 8 lor gbit (); s })
+    (Let { hi = pack (mix (mix (mix 131 (hash ty)) (hash v)) (hash b))
+                   (union (union (info ty) (info v)) (under (info b))); ty; v; b })
+let natlit n = H.intern_g true (NatLit { hi = pack (mix 137 (Z.hash n)) (8 lor gbit ()); n })
+let strlit s = H.intern_g true (StrLit { hi = pack (mix 139 (Hashtbl.hash s)) (8 lor gbit ()); s })
 let proj s idx e =
-  H.intern_g (is_global e) (Proj { h = mix (mix (mix 149 (Name.hash s)) idx) (hash e); i = (info e land (lnot 4)) lor gbit (); s; idx; e })
+  H.intern_g (is_global e) (Proj { hi = pack (mix (mix (mix 149 (Name.hash s)) idx) (hash e)) ((info e land (lnot 4)) lor gbit ()); s; idx; e })
 
 (* Free variables are never shared between domains: per-domain counter. *)
 let fv_counter = Domain.DLS.new_key (fun () -> ref 0)
@@ -96,7 +104,7 @@ let mk_fvar ?v ty =
   let c = Domain.DLS.get fv_counter in
   incr c;
   let id = !c in
-  FVar { h = mix 151 id; i = 9; id; ty; v }
+  FVar { hi = pack (mix 151 id) 9; id; ty; v }
 
 let fvar_ty = function FVar { ty; _ } -> ty | _ -> invalid_arg "fvar_ty"
 
@@ -153,7 +161,7 @@ type expr = t
 module Emap = struct
   type 'a t = { mutable hs : int array; mutable ks : expr array; mutable vs : 'a array;
                 mutable n : int; mutable mask : int; dk : expr; dv : 'a }
-  let dummy_key = BVar { h = 0; i = 0; idx = 0 }
+  let dummy_key = BVar { hi = 0; idx = 0 }
   let create dv cap =
     let cap = let c = ref 16 in while !c < 2 * cap do c := 2 * !c done; !c in
     { hs = Array.make cap 0; ks = Array.make cap dummy_key; vs = Array.make cap dv; n = 0; mask = cap - 1;
@@ -269,7 +277,7 @@ module Tbl2 = Hashtbl.Make (struct
 module Memo = struct
   type m = { mutable hs : int array; mutable ks : t array; mutable offs : int array; mutable vs : t array;
              mutable n : int; mutable mask : int; mutable used : int array }
-  let dummy = BVar { h = 0; i = 0; idx = 0 }
+  let dummy = BVar { hi = 0; idx = 0 }
   let init_cap = 1024
   let create () = { hs = Array.make init_cap 0; ks = Array.make init_cap dummy; offs = Array.make init_cap 0;
                     vs = Array.make init_cap dummy; n = 0; mask = init_cap - 1; used = Array.make (init_cap / 2) 0 }
