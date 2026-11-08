@@ -105,7 +105,9 @@ let create ?(local = Name.Tbl.create 8) ?(safety = Safe) ?session env bi pos = {
    the session, all others to the per-declaration table. *)
 let tfind (local : Expr.t Emap.t) sel c e =
   match c.sess with
-  | Some s when is_global e -> Emap.find (sel s) e
+  | Some s when is_global e ->
+    Ctr.incr Ctr.sess_lookup;
+    let r = Emap.find (sel s) e in Ctr.incr Ctr.sess_hit; r
   | _ -> Emap.find local e
 let tadd (local : Expr.t Emap.t) sel c e r =
   match c.sess with
@@ -216,8 +218,9 @@ let instantiate_type_lparams ci ls = instantiate_lparams ci.ty ci.lparams ls
 let rec infer_core c e infer_only : Expr.t =
   if not (closed e) then fail "type checker does not support loose bound variables";
   let find e = if infer_only then tfind c.infer_only_tbl (fun s -> s.s_infer_only) c e else Emap.find c.infer_tbl e in
+  Ctr.incr Ctr.infer;
   match find e with
-  | r -> r
+  | r -> Ctr.incr Ctr.infer_hit; r
   | exception Not_found ->
     let r = match e with
       | NatLit { n; _ } ->
@@ -419,8 +422,9 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
   | FVar { v = None; _ } -> e
   | FVar { v = Some v; _ } -> whnf_core ~cheap_rec ~cheap_proj c v
   | App _ | Let _ | Proj _ ->
+    Ctr.incr Ctr.whnf_core;
     match tfind c.whnf_core_tbl (fun s -> s.s_whnf_core) c e with
-    | r -> r
+    | r -> Ctr.incr Ctr.whnf_core_hit; r
     | exception Not_found ->
       let cache = not cheap_rec && not cheap_proj in
       let r = match e with
@@ -597,6 +601,7 @@ and unfold_definition_core c e =
        else (match tfind c.unfold_tbl (fun s -> s.s_unfold) c e with
            | r -> Some r
            | exception Not_found ->
+             Ctr.incr Ctr.unfold_inst;
              let r = instantiate_lparams v ci.lparams ls in
              tadd c.unfold_tbl (fun s -> s.s_unfold) c e r; Some r)
      | None -> None)
@@ -674,8 +679,9 @@ and whnf c e =
   | BVar _ | Sort _ | Pi _ | NatLit _ | StrLit _ -> e
   | FVar { v = None; _ } -> e
   | _ ->
+    Ctr.incr Ctr.whnf;
     match tfind c.whnf_tbl (fun s -> s.s_whnf) c e with
-    | r -> r
+    | r -> Ctr.incr Ctr.whnf_hit; r
     | exception Not_found ->
       let rec loop t =
         let t1 = whnf_core c t in
@@ -802,6 +808,7 @@ and try_unfold_proj_app c e =
 
 (* returns: 0 continue, 1 equal, 2 different, 3 unknown *)
 and lazy_delta_reduction_step c (tn : Expr.t ref) (sn : Expr.t ref) =
+  Ctr.incr Ctr.delta_step;
   let unfold e = match unfold_definition c e with
     | Some e' -> whnf_core ~cheap_proj:true c e'
     | None -> fail "unfold failed" in
@@ -916,8 +923,9 @@ and is_def_eq_unit_like c t s =
   | _ -> false
 
 and is_def_eq_core c t s =
+  Ctr.incr Ctr.defeq;
   let r = quick_is_def_eq c t s in
-  if r <> -1 then r = 1 else begin
+  if r <> -1 then (Ctr.incr Ctr.defeq_quick; r = 1) else begin
     if (not (has_fvar t) || c.eager)
     && (match s with Const { n; _ } -> Name.equal n N.bool_true | _ -> false)
     && (match whnf c t with Const { n; _ } -> Name.equal n N.bool_true | _ -> false)
@@ -929,6 +937,7 @@ and is_def_eq_core c t s =
         let r = is_def_eq_proof_irrel c tn sn in
         if r <> -1 then r = 1 else begin
           let tn = ref tn and sn = ref sn in
+          Ctr.incr Ctr.defeq_lazy;
           let r = lazy_delta_reduction c tn sn in
           if r <> -1 then r = 1 else begin
             let tn = !tn and sn = !sn in

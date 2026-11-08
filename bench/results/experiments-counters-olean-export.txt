@@ -1,0 +1,44 @@
+# Experiment 1: compile-time performance counters (src/ctr.ml)
+# check time, s (--stats); p3b = before counters, c0 = default build, c1 = O4L_COUNTERS=1
+                 run 1            run 2
+p3b init -j1     51.87            52.90
+c0  init -j1     48.95            49.51
+c1  init -j1     49.55            50.23
+p3b std  -j4     26.49            25.48
+c0  std  -j4     25.33            24.56
+c1  std  -j4     25.94            25.14
+# objdump: c0 has no reference to Kernel.Ctr outside the module itself (0 call sites).
+
+# counters, -j1:       Init          Init O4L_SESSION=0    perf/app_lam
+infer                 23336172       23913470               40818
+infer.hit             10324124       10200231               16216
+whnf                   2198303        2589900                  34
+whnf.hit               1289875        1164943                   3
+whnf_core             24548283       29570055                 113
+whnf_core.hit          3488714        4005411                   2
+session.lookup         7453862              0                  30
+session.hit            7330781              0                  15
+defeq                 11822104       12134649               16252
+defeq.quick           10383327       10493935               16230
+defeq.lazy_delta       1212388        1414665                  11
+delta.step             3887785        4621029                  13
+unfold.inst             100994         469847                   7
+instantiate           10947788       12915955                4179
+instantiate.node         (n/a)          (n/a)            79993136   (beta_ladder: 4133 / 24008933)
+
+# Experiment 2: olean-export 0.5.0 (cargo build --release) vs tools/Export.lean, Lean 4.35.0
+module   exporter       wall      peak RSS   NDJSON    decls
+Init     Export.lean    39.36 s   2.41 GB    360 MB    65893
+Init     olean-export    2.76 s   0.29 GB    347 MB    59349
+Std      Export.lean    64.24 s   2.78 GB    587 MB   112719
+Std      olean-export    4.72 s   0.45 GB    563 MB    99619
+Lean     Export.lean    95.26 s   4.51 GB    827 MB   207422
+Lean     olean-export    6.24 s   0.66 GB    744 MB   171705
+(blean format for Lean: 233 MB, 6.20 s)
+
+# olean-export compare (after setting nondep:false in ours): 0 differ, 0 only in olean-export;
+# only in ours: Init 6540, Std 13081, Lean 35569 (internal names never referenced + partial defs)
+# ocaml4lean -j4 on olean-export output (all accepted):
+Std   parse 8.46 s  check 25.63 s   (ours: parse 9.05 s check 25.26 s)
+Lean  parse 11.11 s check 29.07 s   (ours: parse 11.85 s check 29.33 s)
+Init  parse 5.11 s  check 14.01 s

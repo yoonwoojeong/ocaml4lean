@@ -146,6 +146,70 @@ Considered and not ported: skipping comparison of proof arguments (Pestka). It i
 justified by proof irrelevance, but deciding that an argument is a proof needs type
 inference, so the saving is small, and it changes which def-eq checks are made.
 
+## Experiments: kernel counters and olean-export
+
+Raw data: `bench/results/experiments-counters-olean-export.txt`.
+
+### Performance counters (kept)
+
+`src/ctr.ml` counts kernel events: inference, whnf, whnf_core and session lookups with
+their cache hits, def-eq calls (and how many end in the quick check or reach lazy
+delta), delta steps, unfoldings that instantiate universe parameters, and
+substitutions with the nodes they visit.
+
+* **Off by default, compiled out.** `enabled` is a compile-time constant. Only
+  `O4L_COUNTERS=1 ./build.sh` sets it, and then the totals are printed to stderr after
+  checking. In the default build the compiler removes every counter site: the
+  disassembly has no reference to the module outside its own code.
+* **Never affects a result.** Counters are only written, and are read once at exit.
+  Each domain has its own padded row of one array, so increments need no atomics.
+* **Overhead.** The default build matches the build before counters (Init on 1
+  domain: 49.0–49.5 s against 51.9–52.9 s, which is run-to-run and code-layout
+  variation). Enabled, counters cost about 1–2% (Init 49.6–50.2 s, Std on 4 domains
+  25.1–25.9 s against 24.6–25.3 s).
+
+What they already showed:
+* With session caches, 98% of session lookups hit (Init: 7.33 M of 7.45 M).
+  Unfoldings that instantiate universe parameters drop 4.7× (470 k → 101 k), and
+  whnf_core calls drop 17%.
+* 88% of def-eq calls end in the quick check.
+* `app-lam` makes only 4,179 substitutions, but they visit 80 M nodes (about 19 k
+  each), and `beta-ladder` visits 24 M. Their cost is the size of each substitution
+  (Θ(n²)), not caching. A fix would have to change how substitution works, for example
+  substitution in an environment instead of eager instantiation.
+
+### olean-export instead of `tools/Export.lean` (recommended for producing inputs)
+
+[olean-export](https://github.com/sdiehl/olean-export) 0.5.0 reads `.olean` files
+directly (Lean 4.26–4.35) and writes the same lean4export NDJSON format. It built with
+`cargo build --release`, and the checker reads its output unchanged: no integration
+work.
+
+| module | `Export.lean` | olean-export | declarations |
+|---|---:|---:|---:|
+| Init | 39.4 s, 2.41 GB | **2.8 s, 0.29 GB** | 65,893 / 59,349 |
+| Std | 64.2 s, 2.78 GB | **4.7 s, 0.45 GB** | 112,719 / 99,619 |
+| Lean | 95.3 s, 4.51 GB | **6.2 s, 0.66 GB** | 207,422 / 171,705 |
+
+* **Same declarations.** `olean-export compare` finds no differing declaration and none
+  that olean-export has and we lack. The only field-level difference is the `letE`
+  `nondep` flag, which olean-export always writes as `false` and the kernel ignores.
+* **Fewer declarations.** olean-export leaves out internal declarations (any name
+  component starting with `_`) that no public declaration uses, and drops `partial`
+  definitions (522 in Init). An export from it therefore checks 83–90% of what
+  `Export.lean` checks, and the official replay (`tools/Replay.lean`) would no longer
+  see the same set. `bench/run.sh` keeps `Export.lean` for that reason.
+* **Accepted in full.** ocaml4lean accepts its Init, Std and Lean exports. Check time is
+  the same as on our exports (Lean: 29.1 s against 29.3 s on 4 domains), since the
+  omitted declarations are cheap. Parsing is 6–7% faster, because the file is smaller.
+* **Benefit.** It is 13–15× faster at exporting, with 6–8× less memory, which makes
+  new workloads (Mathlib-sized ones included) practical to produce.
+* **No change to checking.** Its binary `blean` format (Lean: 233 MB against 744 MB of
+  NDJSON) would at most remove the text-scanning share of parsing, about a third of
+  11 s. The arena feeds checkers NDJSON, and blean's precomputed hashes and
+  loose-bound-variable ranges could not be trusted anyway. A blean reader is not worth
+  its code.
+
 ## Comparison with nanoda, con-leche and con-ron
 
 Not measured. Building them (Rust/Lean projects from GitHub) was blocked by the

@@ -118,6 +118,7 @@ let main () =
   phase "check-start";
   let r = Kernel.Check.run ~jobs:!jobs ~on_error ~budget_mb ~log:memlog env in
   phase "check-end";
+  Kernel.Ctr.report stderr;
   let t2 = Unix.gettimeofday () in
   (* report axioms *)
   if not !quiet then begin

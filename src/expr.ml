@@ -409,9 +409,11 @@ let lower_loose e s d =
    [subst k] = arr.(base - k) if [rev] else arr.(base + k). *)
 let instantiate_core e n (arr : t array) base rev =
   if closed e || n = 0 then e else begin
+    Ctr.incr Ctr.instantiate;
     let cache = MemoH.get_for e 2 in
     let get k = if rev then Array.unsafe_get arr (base - k) else Array.unsafe_get arr (base + k) in
     let rec go e off =
+      Ctr.incr Ctr.inst_node;
       if lbr e <= off then e else
         match e with
         | BVar { idx; _ } ->

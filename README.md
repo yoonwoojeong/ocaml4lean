@@ -55,6 +55,9 @@ declines (code 2).
 Axioms other than `propext`, `Classical.choice`, `Quot.sound` are accepted (as the
 official kernel does) but listed on stderr. `O4L_TIMES=1` prints the slowest
 declarations.
+For analysis, `O4L_COUNTERS=1 ./build.sh` builds a checker that prints kernel event
+counts (cache hits, def-eq paths, substitution work) after checking. The default
+build compiles them out entirely.
 
 ### Producing inputs and the official baseline
 
