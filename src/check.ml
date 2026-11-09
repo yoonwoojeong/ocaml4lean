@@ -20,10 +20,40 @@ let check_type c (ci : cinfo) =
   check_lparams ci;
   with_lparams c ci (fun () -> ignore (Tc.ensure_sort c (Tc.check c ci.ty)))
 
+(* With O4L_NBE=1 the value is first checked by Nbe; any exception there
+   (a kernel error, a declined case, a resource limit) means "no verdict"
+   and the value is checked by Tc, so every rejection is Tc's (see Nbe). *)
+let use_nbe = Sys.getenv_opt "O4L_NBE" = Some "1"
+let nbe_log = Sys.getenv_opt "O4L_NBE_LOG" <> None
+let nbe_trace = Sys.getenv_opt "O4L_NBE_LOG" = Some "2"
+
+let nbe_accepts c (ci : cinfo) v =
+  c.lparams <- Some ci.lparams;
+  let t0 = if nbe_log then Unix.gettimeofday () else 0.0 in
+  if nbe_trace then Printf.eprintf "nbe-start %s\n%!" (Name.to_string ci.name);
+  let r =
+    match Nbe.check_decl c ci v with
+    | () -> Atomic.incr Nbe.accepted; true
+    | exception e ->
+      (match e with Nbe.Decline _ -> Atomic.incr Nbe.declines | _ -> Atomic.incr Nbe.fallbacks);
+      if nbe_log then
+        Printf.eprintf "nbe: %s: %s\n%!" (Name.to_string ci.name)
+          (match e with Nbe.Decline m -> "declined: " ^ m | Kernel_error m -> "error: " ^ m
+                      | e -> "exception: " ^ Printexc.to_string e);
+      false in
+  if nbe_log then begin
+    let dt = Unix.gettimeofday () -. t0 in
+    if dt > 0.2 then Printf.eprintf "nbe-slow: %.2fs %s %s\n%!" dt (Name.to_string ci.name) (if r then "accepted" else "fallback")
+  end;
+  c.lparams <- None;
+  r
+
 let check_value c (ci : cinfo) v =
-  let vt = with_lparams c ci (fun () -> Tc.check c v) in
-  if not (Tc.is_def_eq c vt ci.ty) then
-    fail "type mismatch in declaration '%s'" (Name.to_string ci.name)
+  if use_nbe && nbe_accepts c ci v then () else begin
+    let vt = with_lparams c ci (fun () -> Tc.check c v) in
+    if not (Tc.is_def_eq c vt ci.ty) then
+      fail "type mismatch in declaration '%s'" (Name.to_string ci.name)
+  end
 
 (* ---------------------------------------------------------------- quot *)
 let check_quot env bi pos (l : cinfo list) =

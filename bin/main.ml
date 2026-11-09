@@ -142,6 +142,9 @@ let main () =
     Printf.eprintf "gc: minor %.0f MW, promoted %.0f MW, major %.0f MW, minor_gcs %d, major_gcs %d, top_heap %d MB\n"
       (s.minor_words /. 1e6) (s.promoted_words /. 1e6) (s.major_words /. 1e6) s.minor_collections
       s.major_collections (s.top_heap_words * 8 / 1048576);
+    if Kernel.Check.use_nbe then
+      Printf.eprintf "nbe: accepted %d, declined %d, other fallbacks %d\n"
+        (Atomic.get Kernel.Nbe.accepted) (Atomic.get Kernel.Nbe.declines) (Atomic.get Kernel.Nbe.fallbacks);
     Printf.eprintf "global hash-cons tables: exprs %d, levels %d, names %d\n"
       (Kernel.Expr.H.global_size ()) (Kernel.Level.H.global_size ()) (Kernel.Name.H.global_size ())
   end;
