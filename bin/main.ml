@@ -58,14 +58,12 @@ let main () =
      which are fastest; for inputs over 1 GB (Mathlib is ~6 GB) the overheads
      shrink and the heap is compacted after parsing, which discards the
      parser's garbage (measured on an 827 MB export: 1.38 GB heap after
-     parsing, 0.87 GB live).  The env vars O4L_PARSE_OVERHEAD,
-     O4L_SPACE_OVERHEAD and O4L_COMPACT=0/1 override the policy;
-     O4L_DROP_TABLE=1 frees the hash-cons table after parsing (less memory,
-     much slower; not used by default). *)
+     parsing, 0.87 GB live).  (docs/DESIGN.md §8: to be replaced by one
+     policy computed at startup.) *)
   let env_int v d = match Sys.getenv_opt v with Some x -> int_of_string x | None -> d in
   let input_mb = if !file = "-" then 0 else (try (Unix.stat !file).st_size / 1048576 with _ -> 0) in
   let gc0 = Gc.get () in
-  Gc.set { gc0 with space_overhead = env_int "O4L_PARSE_OVERHEAD" (if input_mb <= 1024 then 200 else 80) };
+  Gc.set { gc0 with space_overhead = (if input_mb <= 1024 then 200 else 80) };
   phase "parse-start";
   let env =
     try
@@ -89,7 +87,7 @@ let main () =
     if !stats then Printf.eprintf "expr table: %s\n%!" (Kernel.Expr.H.global_stats ());
     Printf.printf "parsed\n"; exit 0
   end;
-  if env_int "O4L_COMPACT" (if input_mb > 1024 then 1 else 0) = 1 then begin
+  if input_mb > 1024 then begin
     Gc.compact ();
     phase "compaction-end";
     if !stats then Printf.eprintf "after compaction: heap %d MB\n%!" ((Gc.quick_stat ()).heap_words * 8 / 1048576)
@@ -101,7 +99,7 @@ let main () =
      when the budget leaves room, Check raises it to a floor of up to
      O4L_MIN_OVERHEAD (default 40), see its governor. *)
   let min_overhead = env_int "O4L_MIN_OVERHEAD" 40 in
-  let overhead = env_int "O4L_SPACE_OVERHEAD" (if input_mb <= 1024 then 120 else max 25 (120 * 1024 / input_mb)) in
+  let overhead = if input_mb <= 1024 then 120 else max 25 (120 * 1024 / input_mb) in
   if !stats then Printf.eprintf "space_overhead while checking: %d\n%!" overhead;
   Gc.set { gc0 with space_overhead = overhead };
   (* Memory budget for the governor (see Check): 80% of the cgroup limit or of
@@ -142,10 +140,6 @@ let main () =
     Printf.eprintf "gc: minor %.0f MW, promoted %.0f MW, major %.0f MW, minor_gcs %d, major_gcs %d, top_heap %d MB\n"
       (s.minor_words /. 1e6) (s.promoted_words /. 1e6) (s.major_words /. 1e6) s.minor_collections
       s.major_collections (s.top_heap_words * 8 / 1048576);
-    if Kernel.Check.use_nbe then
-      Printf.eprintf "nbe: accepted %d, declined %d, other fallbacks %d\n"
-        (Atomic.get Kernel.Nbe.accepted) (Atomic.get Kernel.Nbe.declines) (Atomic.get Kernel.Nbe.fallbacks);
-    Kernel.Nbe.print_stats ();
     Printf.eprintf "global hash-cons tables: exprs %d, levels %d, names %d\n"
       (Kernel.Expr.H.global_size ()) (Kernel.Level.H.global_size ()) (Kernel.Name.H.global_size ())
   end;

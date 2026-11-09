@@ -53,13 +53,13 @@ module Set (H : S) = struct
       if k = 0 then raise Not_found
       else if k = h && H.equal (Array.unsafe_get t.vs i) x then Array.unsafe_get t.vs i
       else go ((i + 1) land mask) in
-    go (h land mask)
+    go ((h lsr 1) land mask)
 
   (* returns the slot used *)
   let insert_raw hs vs mask h x =
     let rec go i = if hs_get hs i = 0 then (hs_set hs i h; Array.unsafe_set vs i x; i)
       else go ((i + 1) land mask) in
-    go (h land mask)
+    go ((h lsr 1) land mask)
 
   let record t i =
     if t.track then begin
@@ -116,16 +116,6 @@ module Make (H : sig include S val dummy : t end) = struct
       done;
       global.T.hs <- fresh.T.hs; global.T.vs <- fresh.T.vs; global.T.mask <- fresh.T.mask; global.T.n <- fresh.T.n
     end
-  let global_n = ref 0
-  (* After parsing, the table is only needed for an optional sharing lookup;
-     dropping it frees several words per environment node.  The global nodes
-     remain canonical (they were deduplicated while parsing), which is all
-     that equality relies on. *)
-  let lookups = ref true
-  let drop_global () =
-    global_n := global.T.n;
-    lookups := false;
-    global.T.hs <- T.hs_make 1; global.T.vs <- [| H.dummy |]; global.T.mask <- 0; global.T.n <- 0
   let local : T.t Domain.DLS.key = Domain.DLS.new_key (fun () -> T.create H.dummy 4096)
 
   (* After parsing, values not found in the (frozen) global tier are simply
@@ -136,7 +126,7 @@ module Make (H : sig include S val dummy : t end) = struct
     let h = T.key (H.hash x) in
     if not !frozen then
       (match T.find global x h with y -> y | exception Not_found -> T.add global x h; x)
-    else if try_global && !lookups then
+    else if try_global then
       (match T.find global x h with y -> y | exception Not_found -> x)
     else x
 
@@ -159,6 +149,6 @@ module Make (H : sig include S val dummy : t end) = struct
   let intern x = intern_local x
 
   let reset_local () = T.clear (Domain.DLS.get local)
-  let global_size () = max global.T.n !global_n
+  let global_size () = global.T.n
   let global_stats () = Printf.sprintf "n=%d slots=%d" global.T.n (global.T.mask + 1)
 end

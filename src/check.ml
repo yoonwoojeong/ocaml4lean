@@ -20,42 +20,10 @@ let check_type c (ci : cinfo) =
   check_lparams ci;
   with_lparams c ci (fun () -> ignore (Tc.ensure_sort c (Tc.check c ci.ty)))
 
-(* With O4L_NBE=1 the value is first checked by Nbe; any exception there
-   (a kernel error, a declined case, a resource limit) means "no verdict"
-   and the value is checked by Tc, so every rejection is Tc's (see Nbe). *)
-(* O4L_NBE=1: closure-based core (Nbe); O4L_NBE=2: integer-handle core (Nbh) *)
-let nbe_mode = match Sys.getenv_opt "O4L_NBE" with Some "1" -> 1 | Some "2" -> 2 | _ -> 0
-let use_nbe = nbe_mode > 0
-let nbe_log = Sys.getenv_opt "O4L_NBE_LOG" <> None
-let nbe_trace = Sys.getenv_opt "O4L_NBE_LOG" = Some "2"
-
-let nbe_accepts c (ci : cinfo) v =
-  c.lparams <- Some ci.lparams;
-  let t0 = if nbe_log then Unix.gettimeofday () else 0.0 in
-  if nbe_trace then Printf.eprintf "nbe-start %s\n%!" (Name.to_string ci.name);
-  let r =
-    match (if nbe_mode = 2 then Nbh.check_decl c ci v else Nbe.check_decl c ci v) with
-    | () -> Atomic.incr Nbe.accepted; true
-    | exception e ->
-      (match e with Nbe.Decline _ -> Atomic.incr Nbe.declines | _ -> Atomic.incr Nbe.fallbacks);
-      if nbe_log then
-        Printf.eprintf "nbe: %s: %s\n%!" (Name.to_string ci.name)
-          (match e with Nbe.Decline m -> "declined: " ^ m | Kernel_error m -> "error: " ^ m
-                      | e -> "exception: " ^ Printexc.to_string e);
-      false in
-  if nbe_log then begin
-    let dt = Unix.gettimeofday () -. t0 in
-    if dt > 0.2 then Printf.eprintf "nbe-slow: %.2fs %s %s\n%!" dt (Name.to_string ci.name) (if r then "accepted" else "fallback")
-  end;
-  c.lparams <- None;
-  r
-
 let check_value c (ci : cinfo) v =
-  if use_nbe && nbe_accepts c ci v then () else begin
-    let vt = with_lparams c ci (fun () -> Tc.check c v) in
-    if not (Tc.is_def_eq c vt ci.ty) then
-      fail "type mismatch in declaration '%s'" (Name.to_string ci.name)
-  end
+  let vt = with_lparams c ci (fun () -> Tc.check c v) in
+  if not (Tc.is_def_eq c vt ci.ty) then
+    fail "type mismatch in declaration '%s'" (Name.to_string ci.name)
 
 (* ---------------------------------------------------------------- quot *)
 let check_quot env bi pos (l : cinfo list) =
@@ -353,10 +321,6 @@ let governor_sample g =
 let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_overhead = 40)
     ?(log = false) (env : Env.t) =
   Hc.frozen := true;
-  (* Dropping the environment's hash-cons table saves memory but costs ~45%
-     check time (rebuilt terms are no longer shared with the environment), so
-     it is only done on request. *)
-  if Sys.getenv_opt "O4L_DROP_TABLE" <> None then Expr.H.drop_global ();
   let bi = builtins env in
   let nb = Array.length env.blocks in
   let errs = Array.make nb None in
