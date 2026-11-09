@@ -328,6 +328,17 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_ove
   let internal = Array.make nb false in
   let timing = Sys.getenv_opt "O4L_TIMES" <> None in
   let next = Atomic.make 0 in
+  (* Index of the first block known to be rejected.  The verdict is the first
+     failing block in file order, so blocks after it are never started: they
+     cannot change the verdict, and they may read declarations that were never
+     verified (a rejected inductive's bogus recursor can make a later proof
+     diverge or exhaust memory instead of letting the checker answer "reject").
+     Blocks before it always run, so the reported failure is the same for any
+     number of domains. *)
+  let reject_at = Atomic.make max_int in
+  let rec note_reject i =
+    let cur = Atomic.get reject_at in
+    if i < cur && not (Atomic.compare_and_set reject_at cur i) then note_reject i in
   (* Overhead floor: the largest overhead (at most [min_overhead]) whose
      steady heap, base_heap * (1 + o/100), fits in 3/4 of the budget, but
      never below 10.  When the floor is above the size-based policy the
@@ -356,10 +367,11 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_ove
         done
       end;
       let i = Atomic.fetch_and_add next 1 in
-      if i < nb then begin
+      if i < nb && i > Atomic.get reject_at then loop ()
+      else if i < nb then begin
         let t0 = if timing then Unix.gettimeofday () else 0.0 in
         (try check_block env bi i env.blocks.(i) with
-         | Kernel_error m -> errs.(i) <- Some m
+         | Kernel_error m -> errs.(i) <- Some m; note_reject i
          | e ->
            (* not a verdict about the input: a resource limit or a bug *)
            let m = match e with

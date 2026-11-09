@@ -146,9 +146,9 @@ let main () =
   match r.errors with
   | [] -> Printf.printf "accepted %d declarations\n" ndecls; exit 0
   | (_, m) :: _ when r.internal_only ->
-    Printf.printf "error (%d blocks could not be checked): %s\n" (List.length r.errors) m; exit 3
+    Printf.printf "error (a block could not be checked): %s\n" m; exit 3
   | (_, m) :: _ ->
-    Printf.printf "rejected (%d failing blocks): %s\n" (List.length r.errors) m; exit 1
+    Printf.printf "rejected: %s\n" m; exit 1
 
 (* OCaml exits with code 2 on an uncaught exception, which the arena would
    read as "declined"; report every unexpected failure as an error instead. *)

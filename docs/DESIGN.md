@@ -87,7 +87,11 @@ export file ──parse──▶ environment (frozen, shared read-only)
 2. **Check** blocks in parallel. Block `i` sees only constants introduced by
    blocks `< i`, plus its own members. A block is a single declaration, the
    quotient package, or an inductive block (types, constructors, recursors).
-3. **Report** the first failing block in file order, or acceptance.
+3. **Report** the first failing block in file order, or acceptance. Once a
+   block is known to be rejected, later blocks are not started (they cannot
+   change the verdict, and they may depend on declarations that were never
+   verified: found by mutation testing, where a bogus recursor made a later
+   proof exhaust memory instead of answering "reject").
 
 There is exactly one checking path per kind of declaration, with no
 fallbacks.
@@ -289,10 +293,14 @@ Gates for every change, all of which must pass:
 5. **Unit tests:** `tests/ztest.py` (bignum), level normalization, and the I7
    limits.
 
+6. **Reference differential:** `ref/` (section 13) and `src/` give the same
+   verdict on every arena case and on every mutant produced by
+   `tests/mutate.py` (random corruption of expressions, levels, declarations).
+
 To add:
-- **Mutation testing:** perturb exports (a constructor's type, a recursor rule,
-  a universe level) and require rejection wherever the official kernel
-  rejects. nano-lean's `nl-mutate` is a model.
+- **Mutation testing against the official kernel:** require rejection wherever
+  the official kernel rejects (today only the two checkers are compared).
+  nano-lean's `nl-mutate` is a model.
 - **Official-kernel differential:** `tools/Replay.lean` on every test, where
   the official kernel is available.
 
@@ -323,3 +331,23 @@ Each phase ends with all gates passing (§10) and no new environment variables.
   modest slowdown. Decide by measurement against the 1.5× allowance.
 - Which arena perf tests, if any, rely on heuristics beyond Lean's order? None
   is known; check during phase 4.
+
+## 13. Two checkers
+
+`ref/` is a second checker whose only job is to be easy to trust (`ref/README.md`):
+plain terms, no hash-consing, exact memo tables only, no search heuristics beyond
+Lean's lazy-delta order, universe levels decided semantically, and no code shared
+with `src/`. It is slow (about 7x on Init and without sharing it cannot do the
+performance suites), so it is a test oracle, not a product. Any faster core
+(for example the closure-based evaluator of `docs/CLOSURE.md`) is accepted only
+if it gives the reference's verdict on everything the reference can decide.
+
+Differences in verdict are recorded, not hidden: the reference accepts
+`corner-cases/imax-*` (equal levels that the official kernel's normalization does
+not see; outcome `either`).
+
+Findings so far from running the two against each other:
+- the reference initially accepted `bugs/proj-of-subst-prop` (it answered "not a
+  proposition" for a stuck sort instead of failing; lean4 PR 14807);
+- `src/` kept checking after a rejection and could be driven out of memory by a
+  later block (section 4, step 3; fixed).
