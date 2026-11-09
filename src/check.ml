@@ -248,9 +248,19 @@ let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.res
    free per-domain pools, stacks) -- measured: 0.16 GB above the heap with one
    domain, 0.7 GB with four on an 827 MB input.  So the governor watches the
    real resident set (VmRSS) and, while it is above the budget, lowers the GC
-   space overhead and lets fewer domains start new declarations (never fewer
-   than one), restoring both once RSS is below 3/4 of the budget.  It only
-   changes scheduling and GC pacing, never what is checked. *)
+   space overhead (never below [min_overhead]) and lets fewer domains start
+   new declarations (never fewer than one).  It only changes scheduling and GC
+   pacing, never what is checked.
+
+   Relief is judged against the headroom above the live heap at the start of
+   checking ([base_heap], essentially the environment, which stays live to the
+   end): the heap must be within 60% of [base_heap .. budget].  An absolute
+   threshold (60% of the budget) can never be met once the environment alone
+   is that large -- on the arena's Mathlib (about 6 GB of environment against
+   a 9.4 GB budget) the governor stayed at one domain and space overhead 10
+   for the whole run, 4.4x the official kernel's instructions.  The overhead
+   floor matters for the same reason: every major cycle marks the whole
+   environment, so GC work grows as 1/overhead. *)
 let rss_mb () =
   try
     let ic = open_in "/proc/self/status" in
@@ -265,7 +275,9 @@ let rss_mb () =
 
 type governor = {
   budget_mb : int;
+  base_heap : int;                 (* GC heap (MB) when checking starts *)
   base_overhead : int;
+  min_overhead : int;
   max_jobs : int;
   allowed : int Atomic.t;          (* workers with id < allowed may start a block *)
   busy : bool Atomic.t;            (* one worker samples at a time *)
@@ -289,9 +301,10 @@ let governor_sample g =
        close to the budget.  Relief is judged on the GC heap: well below the
        budget means the memory already mapped has room to be reused. *)
     let pressure = (rss > g.budget_mb && grew) || heap > g.budget_mb * 9 / 10 in
-    let relief = heap < g.budget_mb * 6 / 10 && not grew in
+    let headroom = max 0 (g.budget_mb - g.base_heap) in
+    let relief = heap < g.base_heap + headroom * 6 / 10 && not grew in
     let a', o' =
-      if pressure then max 1 (a - 1), max 10 (g.overhead * 2 / 3)
+      if pressure then max 1 (a - 1), max g.min_overhead (g.overhead * 2 / 3)
       else if relief then min g.max_jobs (a + 1), min g.base_overhead (g.overhead * 3 / 2 + 1)
       else a, g.overhead in
     if o' <> g.overhead then begin
@@ -305,7 +318,8 @@ let governor_sample g =
     Atomic.set g.busy false
   end
 
-let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(log = false) (env : Env.t) =
+let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_overhead = 40)
+    ?(log = false) (env : Env.t) =
   Hc.frozen := true;
   (* Dropping the environment's hash-cons table saves memory but costs ~45%
      check time (rebuilt terms are no longer shared with the environment), so
@@ -318,7 +332,9 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(log = f
   let internal = Array.make nb false in
   let timing = Sys.getenv_opt "O4L_TIMES" <> None in
   let next = Atomic.make 0 in
-  let g = { budget_mb; base_overhead = (Gc.get ()).space_overhead; max_jobs = max 1 jobs;
+  let base_overhead = (Gc.get ()).space_overhead in
+  let g = { budget_mb; base_heap = (Gc.quick_stat ()).heap_words * 8 / 1048576;
+            base_overhead; min_overhead = min base_overhead min_overhead; max_jobs = max 1 jobs;
             allowed = Atomic.make (max 1 jobs); busy = Atomic.make false;
             next_sample = Atomic.make 0.0; overhead = (Gc.get ()).space_overhead; last_rss = 0; log } in
   let governed = budget_mb < max_int in
