@@ -32,50 +32,63 @@ let rec level_params acc = function
   | Max (a, b) | IMax (a, b) -> level_params (level_params acc a) b
   | Param n -> if List.mem n acc then acc else n :: acc
 
-let rec level_succs = function
-  | Zero | Param _ -> 0
-  | Succ l -> 1 + level_succs l
-  | Max (a, b) | IMax (a, b) -> level_succs a + level_succs b
-
-let rec eval_level (sigma : (name * int) list) = function
-  | Zero -> 0
-  | Succ l -> 1 + eval_level sigma l
-  | Max (a, b) -> max (eval_level sigma a) (eval_level sigma b)
-  | IMax (a, b) -> let vb = eval_level sigma b in if vb = 0 then 0 else max (eval_level sigma a) vb
-  | Param n -> List.assoc n sigma
-
 (* Semantic level relations: "for every assignment of the parameters to
-   natural numbers".  Decided by enumeration.  Why a bounded enumeration is
-   exhaustive: a level is built from 0, +1, max, imax, so under an assignment
-   it is a max of terms [p + k] (k <= c, c = number of succ nodes) or of
-   constants, with imax only deciding whether a branch is 0.  Whether two such
-   expressions are equal, or one is >= the other, depends only on the order of
-   the parameter values and of 0 with differences capped at c+1: a gap larger
-   than c+1 between consecutive values can be shrunk to c+1 without changing
-   any comparison.  So values 0 .. n*(c+1) cover every case (n parameters). *)
-let for_all_assignments (ls : level list) (p : (name * int) list -> bool) : bool =
-  let ps = List.fold_left level_params [] ls in
-  let n = List.length ps in
-  let c = List.fold_left (fun a l -> a + level_succs l) 0 ls in
-  let bound = n * (c + 1) in
-  let total = ref 1.0 in
-  for _ = 1 to n do total := !total *. float (bound + 1) done;
-  if !total > 4e6 then raise (Too_complex "too many universe parameters for the reference level check");
-  let rec go ps acc = match ps with
-    | [] -> p acc
-    | x :: rest ->
-      let ok = ref true and v = ref 0 in
-      while !ok && !v <= bound do
-        if not (go rest ((x, !v) :: acc)) then ok := false;
-        incr v
-      done;
-      !ok in
-  go ps []
+   natural numbers", decided exactly.
+   - Only parameters occurring inside the second argument of some [imax] decide
+     whether that [imax] collapses to 0.  Split on each of them: zero, or >= 1.
+     (Whether such a second argument is zero is then determined syntactically.)
+   - Under a split every [imax a b] is 0 or [max a b], so a level is a max of
+     terms, each a constant k or [p + k].  The other parameters range over all
+     naturals (minimum 0); a split-positive parameter has minimum 1.
+   - [A >= B] for all assignments iff every term b of B is dominated by a
+     single term of A: a constant c by a term whose minimum is >= c (all
+     parameters at their minimum), and [q + j] by a term [q + k], k >= j (for
+     large q nothing else grows as fast). *)
+type lterm = C of int | P of name * int
 
-let level_equiv a b = a = b || for_all_assignments [a; b] (fun s -> eval_level s a = eval_level s b)
-let level_geq a b = for_all_assignments [a; b] (fun s -> eval_level s a >= eval_level s b)
-let level_is_zero a = a = Zero || for_all_assignments [a] (fun s -> eval_level s a = 0)
-let level_never_zero a = for_all_assignments [a] (fun s -> eval_level s a >= 1)
+let rec imax_second_params acc = function
+  | Zero | Param _ -> acc
+  | Succ l -> imax_second_params acc l
+  | Max (a, b) -> imax_second_params (imax_second_params acc a) b
+  | IMax (a, b) -> imax_second_params (imax_second_params (level_params acc b) a) b
+
+let rec zero_under zs = function
+  | Zero -> true
+  | Succ _ -> false
+  | Max (a, b) -> zero_under zs a && zero_under zs b
+  | IMax (_, b) -> zero_under zs b
+  | Param p -> List.mem p zs
+
+let rec resolve zs = function
+  | Zero -> [C 0]
+  | Succ l -> List.map (function C k -> C (k + 1) | P (p, k) -> P (p, k + 1)) (resolve zs l)
+  | Max (a, b) -> resolve zs a @ resolve zs b
+  | IMax (a, b) -> if zero_under zs b then [C 0] else resolve zs a @ resolve zs b
+  | Param p -> if List.mem p zs then [C 0] else [P (p, 0)]
+
+let dominates positive t1 t2 =
+  let minv = function C k -> k | P (p, k) -> k + (if List.mem p positive then 1 else 0) in
+  match t1, t2 with
+  | _, C c -> minv t1 >= c
+  | P (p, k), P (q, j) -> p = q && k >= j
+  | C _, P _ -> false
+
+let for_all_splits (ls : level list) (p : name list -> name list -> bool) : bool =
+  let split = List.fold_left imax_second_params [] ls in
+  if List.length split > 20 then raise (Too_complex "too many universe parameters under imax");
+  let rec go remaining zeros =
+    match remaining with
+    | [] -> p zeros (List.filter (fun x -> not (List.mem x zeros)) split)
+    | x :: rest -> go rest (x :: zeros) && go rest zeros in
+  go split []
+
+let level_geq a b =
+  for_all_splits [a; b] (fun zs positive ->
+      let ta = resolve zs a and tb = resolve zs b in
+      List.for_all (fun t2 -> List.exists (fun t1 -> dominates positive t1 t2) ta) tb)
+let level_equiv a b = a = b || (level_geq a b && level_geq b a)
+let level_is_zero a = a = Zero || level_geq Zero a
+let level_never_zero a = level_geq a (Succ Zero)
 
 let rec level_subst (ps : name list) (ls : level list) = function
   | Zero -> Zero

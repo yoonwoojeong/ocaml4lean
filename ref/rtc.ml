@@ -211,13 +211,14 @@ and infer_core t =
     if not (is_def_eq (infer v) ty) then fail "let value has the wrong type";
     infer (instantiate1 b v)
   | Proj (sname, idx, e) -> infer_proj sname idx e
-  | Nat _ -> if not (nat_ok ()) then fail "Nat literal but Nat is not the expected type"; nat_c
-  | Str _ -> if not (str_ok ()) then fail "String literal but String is not available"; Const (string_n, [])
+  | Nat _ -> if find nat_n = None then fail "Nat literal but Nat is not declared"; nat_c
+  | Str _ -> if find string_n = None then fail "String literal but String is not declared"; Const (string_n, [])
 
 and ensure_sort t = match whnf t with Sort l -> l | _ -> fail "type expected: %s" (to_string t)
 
-and is_prop_term e = (* is e a proposition, i.e. e : Prop ? *)
-  match whnf (infer e) with Sort l -> level_is_zero l | _ -> false
+and is_prop_term e = (* is e a proposition, i.e. e : Prop ?  The type of e must reduce to a sort:
+                         a stuck sort is an error, not "no" (Lean PR 14807, bugs/proj-of-subst-prop) *)
+  level_is_zero (ensure_sort (infer e))
 
 and infer_proj sname idx e =
   let bad () = fail "invalid projection %s" (to_string (Proj (sname, idx, e))) in
@@ -293,7 +294,7 @@ and unfold t =
   | _ -> None
 
 and reduce_proj sname idx e =
-  let e' = match whnf e with Str s -> whnf (string_to_ctor s) | x -> x in
+  let e' = match whnf e with Str s when str_ok () -> whnf (string_to_ctor s) | x -> x in
   match app_fn e' with
   | Const (c, _) ->
     (match find c with
@@ -342,8 +343,8 @@ and reduce_iota (d : decl) (r : recr) ls t =
     let major = args.(major_idx) in
     let major = if r.k then (match induct with Some i -> to_ctor_when_k i r major | None -> major) else major in
     let major = match whnf major with
-      | Nat n -> nat_to_ctor n
-      | Str s -> whnf (string_to_ctor s)
+      | Nat n when nat_ok () -> nat_to_ctor n
+      | Str s when str_ok () -> whnf (string_to_ctor s)
       | m -> (match induct with Some i -> to_ctor_when_structure i m | None -> m) in
     match app_fn major with
     | Const (cn, _) ->
