@@ -122,9 +122,9 @@ type st = {
 let fresh_id st = st.next <- st.next + 1; st.next
 (* work counters (O4L_NBE_STATS): evals, neutrals, thunks, forces, conv, quick-same hits,
    whnf, whnf_core, unfolds, type_of, infer, iota *)
-let ncounters = 12
+let ncounters = 14
 let counter_names = [| "eval"; "neutral"; "thunk"; "force"; "conv"; "same-hit"; "whnf"; "whnf_core";
-                       "unfold"; "type_of"; "infer"; "iota" |]
+                       "unfold"; "type_of"; "infer"; "iota"; "clo-hit"; "unf-hit" |]
 let totals = Array.init ncounters (fun _ -> Atomic.make 0)
 let stats_on = Sys.getenv_opt "O4L_NBE_STATS" <> None
 let cnt (st : st) i = if stats_on then st.counts.(i) <- st.counts.(i) + 1
@@ -1051,7 +1051,7 @@ and infer_proj st cx sname idx se =
 let fuel = match Sys.getenv_opt "O4L_NBE_FUEL" with Some v -> int_of_string v | None -> 20_000_000
 
 let create tc = {
-  tc; next = 0; fuel; eager = false; rdepth = 0; counts = Array.make 12 0;
+  tc; next = 0; fuel; eager = false; rdepth = 0; counts = Array.make ncounters 0;
   delta = KTbl.create 64; ctype = KTbl.create 64; subs = KTbl.create 16;
   evals = ETbl.create 256; infers = ETbl.create 256;
   success = PairSet.create 64; failure = PairSet.create 16;

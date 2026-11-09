@@ -23,7 +23,9 @@ let check_type c (ci : cinfo) =
 (* With O4L_NBE=1 the value is first checked by Nbe; any exception there
    (a kernel error, a declined case, a resource limit) means "no verdict"
    and the value is checked by Tc, so every rejection is Tc's (see Nbe). *)
-let use_nbe = Sys.getenv_opt "O4L_NBE" = Some "1"
+(* O4L_NBE=1: closure-based core (Nbe); O4L_NBE=2: integer-handle core (Nbh) *)
+let nbe_mode = match Sys.getenv_opt "O4L_NBE" with Some "1" -> 1 | Some "2" -> 2 | _ -> 0
+let use_nbe = nbe_mode > 0
 let nbe_log = Sys.getenv_opt "O4L_NBE_LOG" <> None
 let nbe_trace = Sys.getenv_opt "O4L_NBE_LOG" = Some "2"
 
@@ -32,7 +34,7 @@ let nbe_accepts c (ci : cinfo) v =
   let t0 = if nbe_log then Unix.gettimeofday () else 0.0 in
   if nbe_trace then Printf.eprintf "nbe-start %s\n%!" (Name.to_string ci.name);
   let r =
-    match Nbe.check_decl c ci v with
+    match (if nbe_mode = 2 then Nbh.check_decl c ci v else Nbe.check_decl c ci v) with
     | () -> Atomic.incr Nbe.accepted; true
     | exception e ->
       (match e with Nbe.Decline _ -> Atomic.incr Nbe.declines | _ -> Atomic.incr Nbe.fallbacks);
