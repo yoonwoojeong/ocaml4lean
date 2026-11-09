@@ -76,27 +76,107 @@ let under i = let r = i lsr 11 in ((if r > 0 then r - 1 else 0) lsl 11) lor (i l
 let g2 a b = info a land info b land 4 <> 0
 let g3 a b c = info a land info b land info c land 4 <> 0
 
-let bvar idx = H.intern_g true (BVar { hi = pack (mix 101 idx) (mk_info ~fv:false ~lp:false ~lbr:(idx + 1)); idx })
-let sort l = H.intern_g true (Sort { hi = pack (mix 103 (Level.hash l)) (mk_info ~fv:false ~lp:(Level.has_param l) ~lbr:0); l })
+let small_bvars =
+  Array.init 4096 (fun idx ->
+    H.intern_g true (BVar { hi = pack (mix 101 idx) (mk_info ~fv:false ~lp:false ~lbr:(idx + 1)); idx }))
+
+let[@inline] bvar idx =
+  if idx < 4096 then Array.unsafe_get small_bvars idx
+  else H.intern_g true (BVar { hi = pack (mix 101 idx) (mk_info ~fv:false ~lp:false ~lbr:(idx + 1)); idx })
+
+let sort l =
+  let h = mix 103 (Level.hash l) in
+  if !Hc.frozen && !H.lookups then
+    let g = H.global in
+    let k = H.T.key h and hs = g.H.T.hs and vs = g.H.T.vs and mask = g.H.T.mask in
+    let rec probe i =
+      let x = H.T.hs_get hs i in
+      if x = 0 then
+        Sort { hi = pack h (mk_info ~fv:false ~lp:(Level.has_param l) ~lbr:0); l }
+      else if x = k && (match Array.unsafe_get vs i with Sort y -> y.l == l | _ -> false) then
+        Array.unsafe_get vs i
+      else probe ((i + 1) land mask) in
+    probe (k land mask)
+  else
+    H.intern_g true (Sort { hi = pack h (mk_info ~fv:false ~lp:(Level.has_param l) ~lbr:0); l })
+
 let const n ls =
   let h = List.fold_left (fun h l -> mix h (Level.hash l)) (mix 107 (Name.hash n)) ls in
-  H.intern_g true (Const { hi = pack h (mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0); n; ls })
-(* After parsing, new nodes are shared only with the (frozen) environment tier;
-   see Hc.intern_g.  A node can only be in that tier if all its children are. *)
-let app f a =
-  H.intern_g (g2 f a) (App { hi = pack (mix (mix 109 (hash f)) (hash a)) (union (info f) (info a)); f; a })
-let lam ty b =
-  H.intern_g (g2 ty b) (Lam { hi = pack (mix (mix 113 (hash ty)) (hash b)) (union (info ty) (under (info b))); ty; b })
-let pi ty b =
-  H.intern_g (g2 ty b) (Pi { hi = pack (mix (mix 127 (hash ty)) (hash b)) (union (info ty) (under (info b))); ty; b })
-let let_ ty v b =
+  if !Hc.frozen && !H.lookups then
+    let g = H.global in
+    let k = H.T.key h and hs = g.H.T.hs and vs = g.H.T.vs and mask = g.H.T.mask in
+    let rec eq_ls a b = match a, b with [], [] -> true | p :: a, q :: b -> p == q && eq_ls a b | _ -> false in
+    let rec probe i =
+      let x = H.T.hs_get hs i in
+      if x = 0 then
+        Const { hi = pack h (mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0); n; ls }
+      else if x = k && (match Array.unsafe_get vs i with Const y -> y.n == n && eq_ls y.ls ls | _ -> false) then
+        Array.unsafe_get vs i
+      else probe ((i + 1) land mask) in
+    probe (k land mask)
+  else
+    H.intern_g true (Const { hi = pack h (mk_info ~fv:false ~lp:(List.exists Level.has_param ls) ~lbr:0); n; ls })
+
+(* After parsing, new nodes whose children are all in the (frozen) global tier
+   are probed directly in [H.global] by hash and field identity BEFORE allocating
+   the record, so global hits allocate 0 words and preserve the [is_global] bit. *)
+let[@inline] app f a =
+  let h = mix (mix 109 (hash f)) (hash a) in
+  if !Hc.frozen then
+    if g2 f a && !H.lookups then
+      let g = H.global in
+      let k = H.T.key h and hs = g.H.T.hs and vs = g.H.T.vs and mask = g.H.T.mask in
+      let rec probe i =
+        let x = H.T.hs_get hs i in
+        if x = 0 then App { hi = pack h (union (info f) (info a)); f; a }
+        else if x = k && (match Array.unsafe_get vs i with App y -> y.f == f && y.a == a | _ -> false) then
+          Array.unsafe_get vs i
+        else probe ((i + 1) land mask) in
+      probe (k land mask)
+    else App { hi = pack h (union (info f) (info a)); f; a }
+  else H.intern_g true (App { hi = pack h (union (info f) (info a)); f; a })
+
+let[@inline] lam ty b =
+  let h = mix (mix 113 (hash ty)) (hash b) in
+  if !Hc.frozen then
+    if g2 ty b && !H.lookups then
+      let g = H.global in
+      let k = H.T.key h and hs = g.H.T.hs and vs = g.H.T.vs and mask = g.H.T.mask in
+      let rec probe i =
+        let x = H.T.hs_get hs i in
+        if x = 0 then Lam { hi = pack h (union (info ty) (under (info b))); ty; b }
+        else if x = k && (match Array.unsafe_get vs i with Lam y -> y.ty == ty && y.b == b | _ -> false) then
+          Array.unsafe_get vs i
+        else probe ((i + 1) land mask) in
+      probe (k land mask)
+    else Lam { hi = pack h (union (info ty) (under (info b))); ty; b }
+  else H.intern_g true (Lam { hi = pack h (union (info ty) (under (info b))); ty; b })
+
+let[@inline] pi ty b =
+  let h = mix (mix 127 (hash ty)) (hash b) in
+  if !Hc.frozen then
+    if g2 ty b && !H.lookups then
+      let g = H.global in
+      let k = H.T.key h and hs = g.H.T.hs and vs = g.H.T.vs and mask = g.H.T.mask in
+      let rec probe i =
+        let x = H.T.hs_get hs i in
+        if x = 0 then Pi { hi = pack h (union (info ty) (under (info b))); ty; b }
+        else if x = k && (match Array.unsafe_get vs i with Pi y -> y.ty == ty && y.b == b | _ -> false) then
+          Array.unsafe_get vs i
+        else probe ((i + 1) land mask) in
+      probe (k land mask)
+    else Pi { hi = pack h (union (info ty) (under (info b))); ty; b }
+  else H.intern_g true (Pi { hi = pack h (union (info ty) (under (info b))); ty; b })
+
+let[@inline] let_ ty v b =
   H.intern_g (g3 ty v b)
     (Let { hi = pack (mix (mix (mix 131 (hash ty)) (hash v)) (hash b))
                    (union (union (info ty) (info v)) (under (info b))); ty; v; b })
 let natlit n = H.intern_g true (NatLit { hi = pack (mix 137 (Z.hash n)) (8 lor gbit ()); n })
 let strlit s = H.intern_g true (StrLit { hi = pack (mix 139 (Hashtbl.hash s)) (8 lor gbit ()); s })
-let proj s idx e =
+let[@inline] proj s idx e =
   H.intern_g (is_global e) (Proj { hi = pack (mix (mix (mix 149 (Name.hash s)) idx) (hash e)) ((info e land (lnot 4)) lor gbit ()); s; idx; e })
+
 
 (* Free variables are never shared between domains: per-domain counter. *)
 let fv_counter = Domain.DLS.new_key (fun () -> ref 0)
@@ -160,13 +240,29 @@ let equal a b =
 type expr = t
 module Emap = struct
   type 'a t = { mutable hs : int array; mutable ks : expr array; mutable vs : 'a array;
-                mutable n : int; mutable mask : int; dk : expr; dv : 'a }
+                mutable n : int; mutable mask : int; mutable used : int array; dk : expr; dv : 'a }
   let dummy_key = BVar { hi = 0; idx = 0 }
   let create dv cap =
     let cap = let c = ref 16 in while !c < 2 * cap do c := 2 * !c done; !c in
     { hs = Array.make cap 0; ks = Array.make cap dummy_key; vs = Array.make cap dv; n = 0; mask = cap - 1;
-      dk = dummy_key; dv }
-  let key h = (h lor 1) land max_int
+      used = Array.make (cap / 2) 0; dk = dummy_key; dv }
+  let clear t =
+    if t.n > 0 then begin
+      if t.mask + 1 > (1 lsl 15) then begin
+        let cap = 256 in
+        t.hs <- Array.make cap 0; t.ks <- Array.make cap t.dk; t.vs <- Array.make cap t.dv;
+        t.mask <- cap - 1; t.used <- Array.make (cap / 2) 0
+      end else begin
+        for k = 0 to t.n - 1 do
+          let i = Array.unsafe_get t.used k in
+          Array.unsafe_set t.hs i 0;
+          Array.unsafe_set t.ks i t.dk;
+          Array.unsafe_set t.vs i t.dv
+        done
+      end;
+      t.n <- 0
+    end
+  let[@inline] key h = (h lor 1) land max_int
   let find t (k : expr) =
     let h = key (hash k) in
     let hs = t.hs and mask = t.mask in
@@ -176,22 +272,31 @@ module Emap = struct
       else if x = h && equal (Array.unsafe_get t.ks i) k then Array.unsafe_get t.vs i
       else go ((i + 1) land mask) in
     go (h land mask)
-  let insert_raw hs ks vs mask h k v =
-    let rec go i =
-      if Array.unsafe_get hs i = 0 then (Array.unsafe_set hs i h; Array.unsafe_set ks i k; Array.unsafe_set vs i v)
-      else go ((i + 1) land mask) in
-    go (h land mask)
+  let rec slot hs mask i = if Array.unsafe_get hs i = 0 then i else slot hs mask ((i + 1) land mask)
   let grow t =
     let cap = 2 * (t.mask + 1) in
+    let mask = cap - 1 in
     let hs = Array.make cap 0 and ks = Array.make cap t.dk and vs = Array.make cap t.dv in
-    for i = 0 to t.mask do
-      let h = t.hs.(i) in if h <> 0 then insert_raw hs ks vs (cap - 1) h t.ks.(i) t.vs.(i)
+    let used = Array.make (cap / 2) 0 in
+    for k = 0 to t.n - 1 do
+      let i = Array.unsafe_get t.used k in
+      let h = Array.unsafe_get t.hs i in
+      let j = slot hs mask (h land mask) in
+      Array.unsafe_set hs j h;
+      Array.unsafe_set ks j (Array.unsafe_get t.ks i);
+      Array.unsafe_set vs j (Array.unsafe_get t.vs i);
+      Array.unsafe_set used k j
     done;
-    t.hs <- hs; t.ks <- ks; t.vs <- vs; t.mask <- cap - 1
+    t.hs <- hs; t.ks <- ks; t.vs <- vs; t.mask <- mask; t.used <- used
   (* add without checking for an existing binding (callers add after a miss) *)
   let add t k v =
     if 2 * (t.n + 1) > t.mask + 1 then grow t;
-    insert_raw t.hs t.ks t.vs t.mask (key (hash k)) k v;
+    let h = key (hash k) in
+    let j = slot t.hs t.mask (h land t.mask) in
+    Array.unsafe_set t.hs j h;
+    Array.unsafe_set t.ks j k;
+    Array.unsafe_set t.vs j v;
+    Array.unsafe_set t.used t.n j;
     t.n <- t.n + 1
 end
 
@@ -199,13 +304,29 @@ end
    used for the definitional-equality success/failure caches. *)
 module Pset = struct
   type t = { mutable hs : int array; mutable as_ : expr array; mutable bs : expr array;
-             mutable n : int; mutable mask : int }
+             mutable n : int; mutable mask : int; mutable used : int array }
   let create cap =
     let cap = let c = ref 16 in while !c < 2 * cap do c := 2 * !c done; !c in
     { hs = Array.make cap 0; as_ = Array.make cap Emap.dummy_key; bs = Array.make cap Emap.dummy_key;
-      n = 0; mask = cap - 1 }
+      n = 0; mask = cap - 1; used = Array.make (cap / 2) 0 }
+  let clear t =
+    if t.n > 0 then begin
+      if t.mask + 1 > (1 lsl 15) then begin
+        let cap = 64 in
+        t.hs <- Array.make cap 0; t.as_ <- Array.make cap Emap.dummy_key; t.bs <- Array.make cap Emap.dummy_key;
+        t.mask <- cap - 1; t.used <- Array.make (cap / 2) 0
+      end else begin
+        for k = 0 to t.n - 1 do
+          let i = Array.unsafe_get t.used k in
+          Array.unsafe_set t.hs i 0;
+          Array.unsafe_set t.as_ i Emap.dummy_key;
+          Array.unsafe_set t.bs i Emap.dummy_key
+        done
+      end;
+      t.n <- 0
+    end
   (* order the pair by hash so that (a, b) and (b, a) are the same key *)
-  let key a b = let ha = hash a and hb = hash b in
+  let[@inline] key a b = let ha = hash a and hb = hash b in
     if ha <= hb then ((mix ha hb) lor 1) land max_int else ((mix hb ha) lor 1) land max_int
   let mem t a b =
     let h = key a b in
@@ -223,26 +344,35 @@ module Pset = struct
     let cap = 2 * (t.mask + 1) in
     let mask = cap - 1 in
     let hs = Array.make cap 0 and as_ = Array.make cap Emap.dummy_key and bs = Array.make cap Emap.dummy_key in
-    for i = 0 to t.mask do
-      let h = t.hs.(i) in
-      if h <> 0 then begin
-        let j = slot hs mask (h land mask) in
-        hs.(j) <- h; as_.(j) <- t.as_.(i); bs.(j) <- t.bs.(i)
-      end
+    let used = Array.make (cap / 2) 0 in
+    for k = 0 to t.n - 1 do
+      let i = Array.unsafe_get t.used k in
+      let h = Array.unsafe_get t.hs i in
+      let j = slot hs mask (h land mask) in
+      Array.unsafe_set hs j h;
+      Array.unsafe_set as_ j (Array.unsafe_get t.as_ i);
+      Array.unsafe_set bs j (Array.unsafe_get t.bs i);
+      Array.unsafe_set used k j
     done;
-    t.hs <- hs; t.as_ <- as_; t.bs <- bs; t.mask <- mask
+    t.hs <- hs; t.as_ <- as_; t.bs <- bs; t.mask <- mask; t.used <- used
   let add t a b =
     if not (mem t a b) then begin
       if 2 * (t.n + 1) > t.mask + 1 then grow t;
       let h = key a b in
       let j = slot t.hs t.mask (h land t.mask) in
-      t.hs.(j) <- h; t.as_.(j) <- a; t.bs.(j) <- b; t.n <- t.n + 1
+      Array.unsafe_set t.hs j h;
+      Array.unsafe_set t.as_ j a;
+      Array.unsafe_set t.bs j b;
+      Array.unsafe_set t.used t.n j;
+      t.n <- t.n + 1
     end
 end
 
 (* ---------- application spines ---------- *)
 let rec get_app_fn = function App { f; _ } -> get_app_fn f | e -> e
-let rec get_app_num_args e = match e with App { f; _ } -> 1 + get_app_num_args f | _ -> 0
+let get_app_num_args e =
+  let rec go acc = function App { f; _ } -> go (acc + 1) f | _ -> acc in
+  go 0 e
 
 (* returns head and args in application order *)
 let get_app_args e =
@@ -327,30 +457,6 @@ module Memo = struct
   (* traversal kinds: 0 lift, 1 lower, 2 instantiate, 3 abstract, 4 lparams *)
   let get k = let m = (Domain.DLS.get key_dls).(k) in clear m; m
 end
-(* Small traversals use a fresh hash table (it stays in the minor heap and
-   dies young); traversals of big terms (saturated size) use the reusable
-   flat-array memo, avoiding the promotion of many cache cells. *)
-(* A traversal starts with a fresh hash table (it lives in the minor heap and
-   dies young).  Once it has more than [migrate_at] entries -- a big term -- it
-   moves to the reusable flat-array memo of its kind, which avoids the GC
-   promotion of many short-lived cache cells. *)
-let migrate_at = (match Sys.getenv_opt "O4L_MIGRATE" with Some v -> int_of_string v | None -> 256)
-module MemoH = struct
-  type c = { kind : int; mutable small : t Tbl2.t; mutable big : Memo.m option }
-  let get_for (_ : t) k = { kind = k; small = Tbl2.create 16; big = None }
-  let find c e off = match c.big with
-    | Some m -> Memo.find m e off
-    | None -> Tbl2.find c.small (e, off)
-  let add c e off v = match c.big with
-    | Some m -> Memo.add m e off v
-    | None ->
-      Tbl2.add c.small (e, off) v;
-      if Tbl2.length c.small > migrate_at then begin
-        let m = Memo.get c.kind in
-        Tbl2.iter (fun (e, off) v -> Memo.add m e off v) c.small;
-        c.big <- Some m; c.small <- Tbl2.create 1
-      end
-end
 
 (* Only subterms of at least this (tree) size are memoised: smaller ones are
    cheaper to rebuild than to look up, and exponential blow-up through DAG
@@ -360,42 +466,66 @@ let memo_min = (match Sys.getenv_opt "O4L_MEMO_MIN" with Some v -> int_of_string
 (* lift loose bvars >= s by d *)
 let lift_loose e s d =
   if d = 0 || lbr e <= s then e else begin
-    let cache = MemoH.get_for e 0 in
+    let cache = Memo.get 0 in
     let rec go e off =
       if lbr e <= s + off then e else
-        match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
-        | r -> r
-        | exception Not_found ->
-          let r = match e with
-            | BVar { idx; _ } -> bvar (idx + d)
-            | App { f; a; _ } -> app (go f off) (go a off)
-            | Lam { ty; b; _ } -> lam (go ty off) (go b (off + 1))
-            | Pi { ty; b; _ } -> pi (go ty off) (go b (off + 1))
-            | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
-            | Proj { s; idx; e; _ } -> proj s idx (go e off)
-            | _ -> e in
-          if size e >= memo_min then MemoH.add cache e off r; r in
+        match e with
+        | BVar { idx; _ } -> bvar (idx + d)
+        | _ ->
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
+          | r -> r
+          | exception Not_found ->
+            let r = match e with
+              | App { f; a; _ } ->
+                let f' = go f off and a' = go a off in
+                if f' == f && a' == a then e else app f' a'
+              | Lam { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else lam ty' b'
+              | Pi { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else pi ty' b'
+              | Let { ty; v; b; _ } ->
+                let ty' = go ty off and v' = go v off and b' = go b (off + 1) in
+                if ty' == ty && v' == v && b' == b then e else let_ ty' v' b'
+              | Proj { s; idx; e = st; _ } ->
+                let st' = go st off in
+                if st' == st then e else proj s idx st'
+              | _ -> e in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
 (* lower loose bvars >= s by d (caller guarantees no bvar in [s-d, s) occurs) *)
 let lower_loose e s d =
   if d = 0 || lbr e <= s then e else begin
-    let cache = MemoH.get_for e 1 in
+    let cache = Memo.get 1 in
     let rec go e off =
       if lbr e <= s + off then e else
-        match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
-        | r -> r
-        | exception Not_found ->
-          let r = match e with
-            | BVar { idx; _ } -> bvar (idx - d)
-            | App { f; a; _ } -> app (go f off) (go a off)
-            | Lam { ty; b; _ } -> lam (go ty off) (go b (off + 1))
-            | Pi { ty; b; _ } -> pi (go ty off) (go b (off + 1))
-            | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
-            | Proj { s; idx; e; _ } -> proj s idx (go e off)
-            | _ -> e in
-          if size e >= memo_min then MemoH.add cache e off r; r in
+        match e with
+        | BVar { idx; _ } -> bvar (idx - d)
+        | _ ->
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
+          | r -> r
+          | exception Not_found ->
+            let r = match e with
+              | App { f; a; _ } ->
+                let f' = go f off and a' = go a off in
+                if f' == f && a' == a then e else app f' a'
+              | Lam { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else lam ty' b'
+              | Pi { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else pi ty' b'
+              | Let { ty; v; b; _ } ->
+                let ty' = go ty off and v' = go v off and b' = go b (off + 1) in
+                if ty' == ty && v' == v && b' == b then e else let_ ty' v' b'
+              | Proj { s; idx; e = st; _ } ->
+                let st' = go st off in
+                if st' == st then e else proj s idx st'
+              | _ -> e in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
@@ -404,7 +534,7 @@ let lower_loose e s d =
    [subst k] = arr.(base - k) if [rev] else arr.(base + k). *)
 let instantiate_core e n (arr : t array) base rev =
   if closed e || n = 0 then e else begin
-    let cache = MemoH.get_for e 2 in
+    let cache = Memo.get 2 in
     let get k = if rev then Array.unsafe_get arr (base - k) else Array.unsafe_get arr (base + k) in
     let rec go e off =
       if lbr e <= off then e else
@@ -413,17 +543,27 @@ let instantiate_core e n (arr : t array) base rev =
           let k = idx - off in
           if k < n then lift_loose (get k) 0 off else bvar (idx - n)
         | _ ->
-          match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
-              | App { f; a; _ } -> app (go f off) (go a off)
-              | Lam { ty; b; _ } -> lam (go ty off) (go b (off + 1))
-              | Pi { ty; b; _ } -> pi (go ty off) (go b (off + 1))
-              | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
-              | Proj { s; idx; e; _ } -> proj s idx (go e off)
+              | App { f; a; _ } ->
+                let f' = go f off and a' = go a off in
+                if f' == f && a' == a then e else app f' a'
+              | Lam { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else lam ty' b'
+              | Pi { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else pi ty' b'
+              | Let { ty; v; b; _ } ->
+                let ty' = go ty off and v' = go v off and b' = go b (off + 1) in
+                if ty' == ty && v' == v && b' == b then e else let_ ty' v' b'
+              | Proj { s; idx; e = st; _ } ->
+                let st' = go st off in
+                if st' == st then e else proj s idx st'
               | _ -> e in
-            if size e >= memo_min then MemoH.add cache e off r; r in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
@@ -432,23 +572,33 @@ let instantiate_gen e n (get : int -> t) = instantiate_core e n (Array.init n ge
 (* bvar 0 := v *)
 let instantiate1 e v =
   if closed e then e else begin
-    let cache = MemoH.get_for e 2 in
+    let cache = Memo.get 2 in
     let rec go e off =
       if lbr e <= off then e else
         match e with
         | BVar { idx; _ } -> if idx = off then lift_loose v 0 off else bvar (idx - 1)
         | _ ->
-          match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
-              | App { f; a; _ } -> app (go f off) (go a off)
-              | Lam { ty; b; _ } -> lam (go ty off) (go b (off + 1))
-              | Pi { ty; b; _ } -> pi (go ty off) (go b (off + 1))
-              | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
-              | Proj { s; idx; e; _ } -> proj s idx (go e off)
+              | App { f; a; _ } ->
+                let f' = go f off and a' = go a off in
+                if f' == f && a' == a then e else app f' a'
+              | Lam { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else lam ty' b'
+              | Pi { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else pi ty' b'
+              | Let { ty; v; b; _ } ->
+                let ty' = go ty off and v' = go v off and b' = go b (off + 1) in
+                if ty' == ty && v' == v && b' == b then e else let_ ty' v' b'
+              | Proj { s; idx; e = st; _ } ->
+                let st' = go st off in
+                if st' == st then e else proj s idx st'
               | _ -> e in
-            if size e >= memo_min then MemoH.add cache e off r; r in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
 
@@ -465,49 +615,77 @@ let instantiate_args e (args : t array) lo hi = instantiate_core e (hi - lo) arg
 (* abstract fvars xs.(0..n-1): fvar xs.(j) becomes bvar (off + n - 1 - j) *)
 let abstract e (xs : t array) n =
   if not (has_fvar e) || n = 0 then e else begin
-    let cache = MemoH.get_for e 3 in
-    let find_idx id =
-      let rec find j = if j < 0 then -1 else
-          (match Array.unsafe_get xs j with FVar x when x.id = id -> j | _ -> find (j - 1)) in
-      find (n - 1) in
+    let cache = Memo.get 3 in
+    let id0 = match Array.unsafe_get xs 0 with FVar x -> x.id | _ -> -1 in
+    let id_last = match Array.unsafe_get xs (n - 1) with FVar x -> x.id | _ -> -2 in
+    (* When [xs] was created by a single binder loop without inner fvar creation,
+       the IDs are strictly contiguous: xs.(j).id = id0 + j. *)
+    let is_contig =
+      id0 >= 0 && id_last - id0 = n - 1 &&
+      (let ok = ref true in
+       for j = 0 to n - 1 do
+         match Array.unsafe_get xs j with
+         | FVar x when x.id = id0 + j -> ()
+         | _ -> ok := false
+       done; !ok) in
+    let[@inline] find_idx id =
+      if is_contig then
+        let j = id - id0 in
+        if j >= 0 && j < n then j else -1
+      else
+        let rec find j = if j < 0 then -1 else
+            (match Array.unsafe_get xs j with FVar x when x.id = id -> j | _ -> find (j - 1)) in
+        find (n - 1) in
     let rec go e off =
       if not (has_fvar e) then e else
         match e with
         | FVar { id; _ } ->
           let j = find_idx id in if j < 0 then e else bvar (off + n - 1 - j)
         | _ ->
-          match (if size e < memo_min then raise Not_found else MemoH.find cache e off) with
+          match (if size e < memo_min then raise Not_found else Memo.find cache e off) with
           | r -> r
           | exception Not_found ->
             let r = match e with
-              | App { f; a; _ } -> app (go f off) (go a off)
-              | Lam { ty; b; _ } -> lam (go ty off) (go b (off + 1))
-              | Pi { ty; b; _ } -> pi (go ty off) (go b (off + 1))
-              | Let { ty; v; b; _ } -> let_ (go ty off) (go v off) (go b (off + 1))
-              | Proj { s; idx; e; _ } -> proj s idx (go e off)
+              | App { f; a; _ } ->
+                let f' = go f off and a' = go a off in
+                if f' == f && a' == a then e else app f' a'
+              | Lam { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else lam ty' b'
+              | Pi { ty; b; _ } ->
+                let ty' = go ty off and b' = go b (off + 1) in
+                if ty' == ty && b' == b then e else pi ty' b'
+              | Let { ty; v; b; _ } ->
+                let ty' = go ty off and v' = go v off and b' = go b (off + 1) in
+                if ty' == ty && v' == v && b' == b then e else let_ ty' v' b'
+              | Proj { s; idx; e = st; _ } ->
+                let st' = go st off in
+                if st' == st then e else proj s idx st'
               | _ -> e in
-            if size e >= memo_min then MemoH.add cache e off r; r in
+            if size e >= memo_min then Memo.add cache e off r; r in
     go e 0
   end
+
 
 let has_loose_bvar0 e =
   (* does bvar 0 occur loosely? *)
   if closed e then false else begin
-    let seen = Tbl2.create 16 in
+    let seen = Memo.get 5 in
     let rec go e off =
       if lbr e <= off then false
       else match e with
         | BVar { idx; _ } -> idx = off
         | _ ->
-          if Tbl2.mem seen (e, off) then false else begin
-            Tbl2.add seen (e, off) ();
+          match Memo.find seen e off with
+          | _ -> false
+          | exception Not_found ->
+            Memo.add seen e off e;
             match e with
             | App { f; a; _ } -> go f off || go a off
             | Lam { ty; b; _ } | Pi { ty; b; _ } -> go ty off || go b (off + 1)
             | Let { ty; v; b; _ } -> go ty off || go v off || go b (off + 1)
             | Proj { e; _ } -> go e off
-            | _ -> false
-          end in
+            | _ -> false in
     go e 0
   end
 
@@ -536,25 +714,37 @@ let mk_lambda_l xs b = mk_lambda (Array.of_list xs) b
 (* ---------- universe parameter instantiation ---------- *)
 let instantiate_lparams e (ps : Name.t list) (ls : Level.t list) =
   if (match ps with [] -> true | _ -> false) || not (has_lparam e) then e else begin
-    let cache = MemoH.get_for e 4 in
+    let cache = Memo.get 4 in
     let lv l = Level.instantiate ps ls l in
     let rec go e =
       if not (has_lparam e) then e else
-        match (if size e < memo_min then raise Not_found else MemoH.find cache e 0) with
+        match (if size e < memo_min then raise Not_found else Memo.find cache e 0) with
         | r -> r
         | exception Not_found ->
           let r = match e with
-            | Sort { l; _ } -> sort (lv l)
+            | Sort { l; _ } ->
+              let l' = lv l in if l' == l then e else sort l'
             | Const { n; ls; _ } -> const n (List.map lv ls)
-            | App { f; a; _ } -> app (go f) (go a)
-            | Lam { ty; b; _ } -> lam (go ty) (go b)
-            | Pi { ty; b; _ } -> pi (go ty) (go b)
-            | Let { ty; v; b; _ } -> let_ (go ty) (go v) (go b)
-            | Proj { s; idx; e; _ } -> proj s idx (go e)
+            | App { f; a; _ } ->
+              let f' = go f and a' = go a in
+              if f' == f && a' == a then e else app f' a'
+            | Lam { ty; b; _ } ->
+              let ty' = go ty and b' = go b in
+              if ty' == ty && b' == b then e else lam ty' b'
+            | Pi { ty; b; _ } ->
+              let ty' = go ty and b' = go b in
+              if ty' == ty && b' == b then e else pi ty' b'
+            | Let { ty; v; b; _ } ->
+              let ty' = go ty and v' = go v and b' = go b in
+              if ty' == ty && v' == v && b' == b then e else let_ ty' v' b'
+            | Proj { s; idx; e = st; _ } ->
+              let st' = go st in
+              if st' == st then e else proj s idx st'
             | _ -> e in
-          if size e >= memo_min then MemoH.add cache e 0 r; r in
+          if size e >= memo_min then Memo.add cache e 0 r; r in
     go e
   end
+
 
 (* generic search: does some subterm satisfy p ? (p is applied to every node) *)
 let exists p e =

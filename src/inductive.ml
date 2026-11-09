@@ -45,10 +45,10 @@ type gen = {
 (* -------------------------------------------------------------------------- *)
 let add_inductive_core env bi pos (overlay : cinfo Name.Tbl.t) (d : decl) (nnested : int) : gen =
   let safety = if d.d_unsafe then Unsafe else Safe in
-  (* a fresh checker whenever the overlay has grown, so caches are never stale *)
+  (* clear caches whenever the overlay has grown, so caches are never stale *)
   let tc () = let c = Tc.create ~local:overlay ~safety env bi pos in c in
   let cur = ref (tc ()) in
-  let refresh () = cur := tc () in
+  let refresh () = Tc.clear_caches !cur in
   let whnf e = Tc.whnf !cur e in
   let infer e = Tc.infer !cur e in
   let is_def_eq a b = Tc.is_def_eq !cur a b in
@@ -326,7 +326,8 @@ let add_inductive_core env bi pos (overlay : cinfo Name.Tbl.t) (d : decl) (nnest
           let _, it_indices = get_i_indices rt in
           let intro_app = mk_app_arr (mk_app_arr (Expr.const cname levels) params_a) b_u in
           let lhs = app (mk_app_arr rec_pre it_indices) intro_app in
-          let c = tc () in
+          let c = !cur in
+          Tc.clear_caches c;
           let expected = Tc.infer c lhs in
           let reduct = Tc.whnf c lhs in
           let actual = Tc.infer c reduct in
