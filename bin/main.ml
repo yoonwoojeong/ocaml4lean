@@ -3,6 +3,28 @@
    3 error (usage, I/O, unparsable input, internal error).  Code 2 ("declined")
    is never used: the checker does not decline inputs. *)
 
+(* Memory available to this process, in MB: the cgroup limit if there is one,
+   else physical memory; 0 if neither can be read. *)
+let memory_mb () =
+  let first_line f = try let ic = open_in f in let l = input_line ic in close_in ic; Some l with _ -> None in
+  let cgroup = match first_line "/sys/fs/cgroup/memory.max" with
+    | Some l -> (try int_of_string (String.trim l) / 1048576 with _ -> 0)
+    | None -> 0 in
+  let total =
+    try
+      let ic = open_in "/proc/meminfo" in
+      let r = ref 0 in
+      (try while true do
+           let l = input_line ic in
+           if String.length l > 9 && String.sub l 0 9 = "MemTotal:" then
+             r := Scanf.sscanf (String.sub l 9 (String.length l - 9)) " %d" (fun kb -> kb / 1024)
+         done with End_of_file -> ());
+      close_in ic; !r
+    with _ -> 0 in
+  if cgroup > 0 && (total = 0 || cgroup < total) then cgroup else total
+
+let heap_mb () = (Gc.quick_stat ()).heap_words * 8 / 1048576
+
 let main () =
   let jobs = ref 1 and file = ref "" and stats = ref false and quiet = ref false and parse_only = ref false in
   let spec = [
@@ -14,20 +36,20 @@ let main () =
   Arg.parse spec (fun f -> file := f) "ocaml4lean [-j N] [--stats] FILE.ndjson  (FILE may be - for stdin)";
   if !file = "" then (prerr_endline "no input file"; exit 3);
   let t0 = Unix.gettimeofday () in
-  (* Memory policy.  The environment (about the size of the input file once
-     parsed) stays live for the whole run, and OCaml's heap settles near
-     live * (1 + space_overhead/100).  Small inputs use generous overheads,
-     which are fastest; for inputs over 1 GB (Mathlib is ~6 GB) the overheads
-     shrink and the heap is compacted after parsing, which discards the
-     parser's garbage (measured on an 827 MB export: 1.38 GB heap after
-     parsing, 0.87 GB live). *)
-  let input_mb = if !file = "-" then 0 else (try (Unix.stat !file).st_size / 1048576 with _ -> 0) in
+  (* Memory rule (docs/DESIGN.md section 8).  The parsed environment stays
+     live for the whole run and OCaml's heap settles near
+     live * (1 + space_overhead / 100).  After parsing, the heap is compacted
+     (the parser's garbage goes back to the OS and the live size L is known),
+     and the overhead for checking is the largest value, within [25, 120], at
+     which L * (1 + o/100) stays under half of the machine's memory.  Nothing
+     is adjusted later; running out of memory is an error (exit 3). *)
   let gc0 = Gc.get () in
-  Gc.set { gc0 with space_overhead = (if input_mb <= 1024 then 200 else 80) };
+  Gc.set { gc0 with space_overhead = 120 };
+  let input_mb = if !file = "-" then 0 else (try (Unix.stat !file).st_size / 1048576 with _ -> 0) in
   let env =
     try
       let ic = if !file = "-" then stdin else open_in_bin !file in
-      let size_hint = if !file = "-" then 0 else input_mb * 1048576 in
+      let size_hint = input_mb * 1048576 in
       (* expressions are ~90% of the lines; after hash-consing ~90% remain *)
       Kernel.Expr.H.presize (size_hint / 52 * 8 / 10);
       let env = Kernel.Parse.read_channel ~size_hint ic in
@@ -35,28 +57,14 @@ let main () =
     with
     | Kernel.Parse.Bad m -> Printf.printf "parse error: %s\n" m; exit 3
     | Sys_error m -> Printf.printf "error: %s\n" m; exit 3 in
-  (* for stdin, estimate the size from the heap *)
-  let input_mb = if !file = "-" then (Gc.quick_stat ()).heap_words * 8 / 1048576 / 2 else input_mb in
-  if !stats then begin
-    let s = Gc.quick_stat () in
-    Printf.eprintf "after parse: heap %d MB, top_heap %d MB\n%!" (s.heap_words * 8 / 1048576) (s.top_heap_words * 8 / 1048576)
-  end;
-  if !parse_only then begin
-    if !stats then Printf.eprintf "expr table: %s\n%!" (Kernel.Expr.H.global_stats ());
-    Printf.printf "parsed\n"; exit 0
-  end;
-  if input_mb > 1024 then begin
-    Gc.compact ();
-    if !stats then Printf.eprintf "after compaction: heap %d MB\n%!" ((Gc.quick_stat ()).heap_words * 8 / 1048576)
-  end;
-  let t1 = Unix.gettimeofday () in
-  (* measured on an 827 MB export with this policy forced: overhead 25 gives a
-     peak RSS of 2.1x the input (1.77 GB) for ~30% more check time.  Every
-     major cycle marks the whole environment, so GC work grows as 1/overhead. *)
-  let overhead = if input_mb <= 1024 then 120 else max 25 (120 * 1024 / input_mb) in
-  if !stats then Printf.eprintf "space_overhead while checking: %d\n%!" overhead;
+  if !stats then Printf.eprintf "after parse: heap %d MB, expr table: %s\n%!" (heap_mb ()) (Kernel.Expr.H.global_stats ());
+  if !parse_only then (Printf.printf "parsed\n"; exit 0);
+  Gc.compact ();
+  let live_mb = heap_mb () and mem_mb = memory_mb () in
+  let overhead = if mem_mb = 0 || live_mb = 0 then 120 else max 25 (min 120 (100 * (mem_mb / 2 - live_mb) / live_mb)) in
   Gc.set { gc0 with space_overhead = overhead };
-  if !stats then Printf.eprintf "expr table: %s\n%!" (Kernel.Expr.H.global_stats ());
+  if !stats then Printf.eprintf "after compaction: live %d MB, memory %d MB, space_overhead %d\n%!" live_mb mem_mb overhead;
+  let t1 = Unix.gettimeofday () in
   let ndecls = Kernel.Name.Tbl.length env.consts in
   let on_error i m =
     if not !quiet then
