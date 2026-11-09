@@ -125,3 +125,17 @@ commit with the gates' results in its message, so any step can be reverted alone
 - `README.md` says "~3,600 lines"; `src/` + `bin/` is 3,936 on `main`.
 - `arena/ocaml4lean.yaml` and `README.md` describe the governor as a feature;
   under this plan it is removed.
+
+## 8. State of the branch, verified in the proposal's environment (2026-11-09)
+
+OCaml 5.4.0 (opam), 4 vCPU, 15 GB; Lean not installed, so gates 2, 3 and 6
+were not run.
+
+| check | result |
+|---|---|
+| `tests/arena_ndjson.sh`, production checker | 24/24 as expected |
+| same, `ref/refcheck` | 24/24 as expected |
+| production vs reference exit codes on the 24 cases | identical |
+| `ref/tests/run_levels.sh` (level procedure vs brute force) | 20,000 pairs, 0 mismatches |
+| `tests/ztest.py` (bignum vs Python) | 26,000 cases, 0 mismatches |
+| `tests/mutate.py`, 400 mutants of `corner-cases/proof-param-ok` + 300 of `bugs/rec-missing-ih` | 0 disagreements |
