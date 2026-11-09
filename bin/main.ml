@@ -98,9 +98,10 @@ let main () =
   (* measured on an 827 MB export with this policy forced: overhead 25 gives a
      peak RSS of 2.1x the input (1.77 GB) for ~30% more check time.  Every
      major cycle marks the whole environment, so GC work grows as 1/overhead;
-     below 40 it dominates on Mathlib-sized inputs (see Check's governor). *)
+     when the budget leaves room, Check raises it to a floor of up to
+     O4L_MIN_OVERHEAD (default 40), see its governor. *)
   let min_overhead = env_int "O4L_MIN_OVERHEAD" 40 in
-  let overhead = env_int "O4L_SPACE_OVERHEAD" (if input_mb <= 1024 then 120 else max min_overhead (120 * 1024 / input_mb)) in
+  let overhead = env_int "O4L_SPACE_OVERHEAD" (if input_mb <= 1024 then 120 else max 25 (120 * 1024 / input_mb)) in
   if !stats then Printf.eprintf "space_overhead while checking: %d\n%!" overhead;
   Gc.set { gc0 with space_overhead = overhead };
   (* Memory budget for the governor (see Check): 80% of the cgroup limit or of
