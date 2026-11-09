@@ -100,11 +100,11 @@ arenas (`MALLOC_ARENA_MAX=1`, trim/mmap thresholds: < 3% change) and GC accounti
 per-domain memory outside the GC's accounting (allocator slack around large blocks,
 which OCaml 5 obtains from `malloc`; free per-domain pools; domain stacks). Since it
 cannot be predicted from the input, it is controlled: the governor samples VmRSS and
-the GC heap every 0.2 s and, under pressure, lowers `space_overhead` (down to 10) and
-lets fewer domains start new declarations (down to 1); it relaxes when the GC heap is
-well below budget. Budget: 60% of the cgroup limit or of physical memory (9.6 GB on
-the arena runner), `O4L_MEM_BUDGET_MB` to override. It changes scheduling and GC
-pacing only.
+the GC heap every 0.2 s and, under pressure, lowers `space_overhead` (down to a floor,
+see §3a) and lets fewer domains start new declarations (down to 1); it relaxes when the
+GC heap is well within the headroom above the live environment (§3a). Budget: 80% of
+the cgroup limit or of physical memory (12.5 GB on the arena runner; 60% before §3a),
+`O4L_MEM_BUDGET_MB` to override. It changes scheduling and GC pacing only.
 
 Governor verification:
 
@@ -117,6 +117,52 @@ Finding from the second run: RSS is a high-water mark under OCaml 5 (freed pool
 memory stays mapped), so a governor that waits for RSS to drop never relaxes. The
 governor therefore throttles on *growth* of RSS above budget (or GC heap near budget)
 and relaxes on the GC heap being well below budget.
+
+## 3a. The governor latch on the arena's Mathlib (fixed)
+
+Arena record for `mathlib` at rev `51d1b48` (round of 2026-11-08): accepted, but
+**80.3 min wall** (timeout 94.7 min), 50.6 × 10¹² instructions (4.36× the official
+kernel; the arena's "2.34 h" is that count at 6 × 10⁹/s), peak RSS 11.9 GB, CPU/wall
+1.62. Every other large test ran at 1.2–3× the official kernel's instructions with
+CPU/wall ≈ 3, and stayed below the governor's budget.
+
+Cause: the governor relaxed only when the GC heap fell below 60% of the budget
+(5.6 GB of a 9.4 GB budget on the 16 GB runner). Mathlib's environment alone is larger
+and stays live to the end, so after the first pressure signal the run stayed on
+**one domain with `space_overhead` 10** for its whole length. Every major cycle marks
+the whole environment, so GC work grows as 1/overhead.
+
+Changes:
+* **Relief relative to the live heap**: the governor records the GC heap at the start
+  of checking (`base_heap`) and relaxes when `heap < base_heap + 60% × (budget −
+  base_heap)`.
+* **Adaptive overhead floor**: the largest overhead ≤ `O4L_MIN_OVERHEAD` (default 40)
+  whose steady heap `base_heap × (1 + o/100)` fits in 3/4 of the budget, at least 10.
+  Checking starts at the floor when it is above the size-based policy, and the
+  governor never goes below it.
+* **Budget 80%** of memory instead of 60% (the official kernel itself peaks at 10.7 GB
+  on that runner).
+
+Measured on the 6.2 GB Mathlib proxy (4 domains, 4 vCPU / 15 GB VM, OCaml 5.4.0; all
+1,055,791 declarations accepted in every run). A budget of 5,800 MB reproduces the
+arena's ratio of live environment to old budget (3.9 GB / 5.8 GB vs. ~6 GB / 9.4 GB);
+8,100 MB is the same scaling of the new 80% budget.
+
+| binary | budget | floor / start overhead | governor | check | wall | user CPU | peak RSS | major GCs |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| old (`8715624`) | 5,800 MB | 10 / 25 | **latched at 1 domain, overhead 10** | 1,328 s | 25.2 min | 36.0 min | 6,382 MB | 210 |
+| new | 5,800 MB | 11 / 25 | throttles and recovers (1–4 domains) | 461 s | 10.7 min | 25.4 min | 6,629 MB | 107 |
+| new | 8,100 MB | 40 / 40 | never throttled | **313 s** | **8.2 min** | 21.4 min | 8,084 MB | 64 |
+| old, ungoverned | — | — / 25 | off | 368 s | 9.3 min | 25.3 min | 7,645 MB | 90 |
+
+The old binary's latched run is 3.6× slower to check than the ungoverned run, the
+same order as the arena's slowdown; with the fix the same budget costs 25% instead of
+260%. With room in the budget the higher floor makes checking 15% faster than the old
+ungoverned run, for 6% more peak RSS.
+
+Expected on the arena: with a 12.5 GB budget and Mathlib's live heap estimated at
+7.5–8 GB (from the latched run's peak, scaled by the proxy's peak/live ratio), the
+floor is about 25 (the old starting overhead) and the governor can relax again.
 
 ## 4. OxCaml evaluation
 
@@ -193,7 +239,7 @@ tables); it is the strongest argument for a future migration.
 | 0 | race fix: no `lazy` values shared by domains | done (`95b59fa`) |
 | A | presized parser index and environment hash-cons table | done |
 | B | one-word node header (31-bit hash, 32-bit info; refuse, never truncate, loose-bvar ranges ≥ 2²¹) | done |
-| G | RSS-driven governor: throttles domains and GC overhead on RSS growth above budget, relaxes on GC heap below budget | done |
+| G | RSS-driven governor: throttles domains and GC overhead on RSS growth above budget, relaxes on GC heap within the headroom above the live environment (§3a) | done |
 | C | lower `space_overhead` while checking large inputs, compaction after parsing (from the first memory round) | done (`3753af7`) |
 | D | *future*: reuse per-domain cache arrays across declarations to reduce large-block churn | not started: needs per-context ownership of caches (contexts are nested in inductive checking, so sharing them naively would mix caches of different environments — a soundness hazard) |
 | E | *future*: OxCaml build profile (flambda2, later the mode system for race freedom) | evaluated, not adopted for the arena (§4) |
@@ -205,9 +251,9 @@ Specifications:
 * **Flags**: `-unsafe -inline 200`, plus `-O3` with flambda or flambda2 (`build.sh`).
 * **Runtime/GC policy** (input size from `stat`, or heap size for stdin):
   parse `space_overhead` 200 (≤ 1 GB) / 80 (> 1 GB); compaction after parsing for
-  inputs > 1 GB; checking `space_overhead` 120 (≤ 1 GB) or `max 25 (120·1024/MB)`;
-  governor budget 60% of `memory.max` or `MemTotal`. Overrides:
-  `O4L_PARSE_OVERHEAD`, `O4L_SPACE_OVERHEAD`, `O4L_COMPACT`, `O4L_MEM_BUDGET_MB`
+  inputs > 1 GB; checking `space_overhead` 120 (≤ 1 GB) or `max 25 (120·1024/MB)`, raised to the
+  governor's floor (§3a); governor budget 80% of `memory.max` or `MemTotal`. Overrides:
+  `O4L_PARSE_OVERHEAD`, `O4L_SPACE_OVERHEAD`, `O4L_MIN_OVERHEAD`, `O4L_COMPACT`, `O4L_MEM_BUDGET_MB`
   (0 disables the governor), `O4L_DROP_TABLE` (not recommended: −45% speed).
 * **Arena**: `threads: 4`, `run: ./ocaml4lean -j 4 "$IN"`; exit 0 accept, 1 reject,
   3 error (internal failures, including the loose-bvar range limit, are never
