@@ -34,15 +34,12 @@ module Set (H : S) = struct
   let hs_set (a : hs) i v = Bigarray.Array1.unsafe_set a i (Int32.of_int v)
 
   type t = { mutable hs : hs; mutable vs : H.t array; mutable n : int; mutable mask : int;
-             dummy : H.t; mutable used : int array; track : bool }
-  (* [used] records occupied slots (only for scratch tables, [track]) so that
-     clearing costs O(entries) rather than O(capacity). *)
+             dummy : H.t }
 
   (* capacity: smallest power of two holding [cap] entries below 3/4 load *)
-  let create ?(track = false) dummy cap =
+  let create dummy cap =
     let cap = let c = ref 16 in while 3 * !c < 4 * (cap + 1) do c := 2 * !c done; !c in
-    { hs = hs_make cap; vs = Array.make cap dummy; n = 0; mask = cap - 1; dummy;
-      used = (if track then Array.make 1024 0 else [||]); track }
+    { hs = hs_make cap; vs = Array.make cap dummy; n = 0; mask = cap - 1; dummy }
 
   let key h = (h land 0x3FFFFFFF) lor 1     (* fits int32; 0 marks an empty slot *)
 
@@ -61,34 +58,20 @@ module Set (H : S) = struct
       else go ((i + 1) land mask) in
     go ((h lsr 1) land mask)
 
-  let record t i =
-    if t.track then begin
-      if t.n >= Array.length t.used then begin
-        let u = Array.make (2 * Array.length t.used) 0 in
-        Array.blit t.used 0 u 0 (Array.length t.used); t.used <- u
-      end;
-      Array.unsafe_set t.used t.n i
-    end
-
   let grow t =
     let cap = 2 * (t.mask + 1) in
     let hs = hs_make cap and vs = Array.make cap t.dummy in
     let mask = cap - 1 in
-    let k = ref 0 in
     for i = 0 to t.mask do
       let h = hs_get t.hs i in
-      if h <> 0 then begin
-        let j = insert_raw hs vs mask h t.vs.(i) in
-        if t.track then (t.used.(!k) <- j; incr k)
-      end
+      if h <> 0 then ignore (insert_raw hs vs mask h t.vs.(i))
     done;
     t.hs <- hs; t.vs <- vs; t.mask <- mask
 
   let add t x h =
     (* grow at 3/4 load: the environment's table is the largest structure *)
     if 4 * (t.n + 1) > 3 * (t.mask + 1) then grow t;
-    let i = insert_raw t.hs t.vs t.mask h x in
-    record t i;
+    ignore (insert_raw t.hs t.vs t.mask h x);
     t.n <- t.n + 1
 
   let clear t =
