@@ -274,17 +274,77 @@ module Tbl2 = Hashtbl.Make (struct
     let hash (a, i) = mix (hash a) i
   end)
 
-(* Per-traversal memo: a fresh small hash table for each lift/lower/instantiate/
-   abstract call.  Measured on Init (phase 1, 4 vCPU): always-small 76.1 s (1 domain) /
-   28.5 s (4); the old "small, migrating to a per-domain flat Memo after 256 entries"
-   76.6 s / 28.3 s; always-flat 80.7 s / 29.4 s.  So the migration buys nothing within
-   noise and is not kept; the flat per-domain memo was not faster (large arrays in
-   the major heap cost GC scanning, docs/NBE.md), so it is not kept either. *)
+(* Exact memo tables keyed by (node identity, binder offset), one per domain
+   and traversal kind, reused across calls: entries live in flat arrays (no
+   per-entry allocation, hence no promotion of cache cells by the GC), and a
+   list of used slots makes clearing proportional to the previous use. *)
+module Memo = struct
+  type m = { mutable hs : int array; mutable ks : t array; mutable offs : int array; mutable vs : t array;
+             mutable n : int; mutable mask : int; mutable used : int array }
+  let dummy = BVar { hi = 0; idx = 0 }
+  let init_cap = 1024
+  let create () = { hs = Array.make init_cap 0; ks = Array.make init_cap dummy; offs = Array.make init_cap 0;
+                    vs = Array.make init_cap dummy; n = 0; mask = init_cap - 1; used = Array.make (init_cap / 2) 0 }
+  let clear m =
+    if m.n > 0 then begin
+      if m.mask + 1 > (1 lsl 16) then begin
+        m.hs <- Array.make init_cap 0; m.ks <- Array.make init_cap dummy; m.offs <- Array.make init_cap 0;
+        m.vs <- Array.make init_cap dummy; m.mask <- init_cap - 1; m.used <- Array.make (init_cap / 2) 0
+      end else
+        for k = 0 to m.n - 1 do
+          let i = Array.unsafe_get m.used k in
+          Array.unsafe_set m.hs i 0; Array.unsafe_set m.ks i dummy; Array.unsafe_set m.vs i dummy
+        done;
+      m.n <- 0
+    end
+  let key e off = ((mix (hash e) off) lor 1) land max_int
+  let find m e off =
+    let h = key e off in
+    let mask = m.mask in
+    let rec go i =
+      let x = Array.unsafe_get m.hs i in
+      if x = 0 then raise Not_found
+      else if x = h && Array.unsafe_get m.ks i == e && Array.unsafe_get m.offs i = off then Array.unsafe_get m.vs i
+      else go ((i + 1) land mask) in
+    go ((h lsr 1) land mask)
+  let rec slot hs mask h i = if Array.unsafe_get hs i = 0 then i else slot hs mask h ((i + 1) land mask)
+  let grow m =
+    let cap = 2 * (m.mask + 1) in
+    let mask = cap - 1 in
+    let hs = Array.make cap 0 and ks = Array.make cap dummy and offs = Array.make cap 0 and vs = Array.make cap dummy in
+    let used = Array.make (cap / 2) 0 in
+    for k = 0 to m.n - 1 do
+      let i = m.used.(k) in
+      let h = m.hs.(i) in
+      let j = slot hs mask h ((h lsr 1) land mask) in
+      hs.(j) <- h; ks.(j) <- m.ks.(i); offs.(j) <- m.offs.(i); vs.(j) <- m.vs.(i); used.(k) <- j
+    done;
+    m.hs <- hs; m.ks <- ks; m.offs <- offs; m.vs <- vs; m.mask <- mask; m.used <- used
+  let add m e off v =
+    if 2 * (m.n + 1) > m.mask + 1 then grow m;
+    let h = key e off in
+    let j = slot m.hs m.mask h ((h lsr 1) land m.mask) in
+    Array.unsafe_set m.hs j h; Array.unsafe_set m.ks j e; Array.unsafe_set m.offs j off; Array.unsafe_set m.vs j v;
+    Array.unsafe_set m.used m.n j;
+    m.n <- m.n + 1
+  let key_dls = Domain.DLS.new_key (fun () -> Array.init 6 (fun _ -> create ()))
+  (* traversal kinds: 0 lift, 1 lower, 2 instantiate, 3 abstract, 4 lparams *)
+  let get k = let m = (Domain.DLS.get key_dls).(k) in clear m; m
+end
+(* One rule for every traversal: the per-domain flat memo (kinds are never nested
+   within the same kind: instantiate calls lift, which has its own kind).
+   Measured with the three candidates (phase 1, 4 vCPU), seconds:
+                    Init j=1  Init j=4  perf/beta-ladder  perf/app-lam
+     flat (kept)      80.7      29.4          1.6              9.7
+     small, migrating 76.6      28.3          2.0              9.3
+     small only       76.1      28.5          3.3             17.3
+   Init alone hides the large-traversal cases, where always-small is 1.8x slower;
+   flat is simplest and within 5% of the migrating rule everywhere. *)
 module MemoH = struct
-  type c = t Tbl2.t
-  let get_for (_ : t) (_ : int) : c = Tbl2.create 16
-  let find c e off = Tbl2.find c (e, off)
-  let add c e off v = Tbl2.add c (e, off) v
+  type c = Memo.m
+  let get_for (_ : t) k : c = Memo.get k
+  let find = Memo.find
+  let add = Memo.add
 end
 
 (* lift loose bvars >= s by d *)
