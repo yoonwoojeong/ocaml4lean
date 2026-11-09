@@ -241,85 +241,11 @@ type result = { errors : (int * string) list; checked : int; internal_only : boo
 
 let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.reset_local ()
 
-(* ------------------------------------------------------------ governor *)
-(* Memory governor.  Peak memory depends on the input's shape (how large the
-   declarations being checked at the same time are) and, with several domains,
-   includes per-domain memory the GC does not account for (allocator slack,
-   free per-domain pools, stacks) -- measured: 0.16 GB above the heap with one
-   domain, 0.7 GB with four on an 827 MB input.  So the governor watches the
-   real resident set (VmRSS) and, while it is above the budget, lowers the GC
-   space overhead (never below a floor derived from the headroom, see [run]) and lets fewer domains start
-   new declarations (never fewer than one).  It only changes scheduling and GC
-   pacing, never what is checked.
-
-   Relief is judged against the headroom above the live heap at the start of
-   checking ([base_heap], essentially the environment, which stays live to the
-   end): the heap must be within 60% of [base_heap .. budget].  An absolute
-   threshold (60% of the budget) can never be met once the environment alone
-   is that large -- on the arena's Mathlib (about 6 GB of environment against
-   a 9.4 GB budget) the governor stayed at one domain and space overhead 10
-   for the whole run, 4.4x the official kernel's instructions.  The overhead
-   floor matters for the same reason: every major cycle marks the whole
-   environment, so GC work grows as 1/overhead. *)
-let rss_mb () =
-  try
-    let ic = open_in "/proc/self/status" in
-    let r = ref 0 in
-    (try while true do
-         let l = input_line ic in
-         if String.length l > 6 && String.sub l 0 6 = "VmRSS:" then
-           r := Scanf.sscanf (String.sub l 6 (String.length l - 6)) " %d" (fun x -> x / 1024)
-       done with End_of_file -> ());
-    close_in ic; !r
-  with _ -> 0
-
-type governor = {
-  budget_mb : int;
-  base_heap : int;                 (* GC heap (MB) when checking starts *)
-  base_overhead : int;
-  min_overhead : int;
-  max_jobs : int;
-  allowed : int Atomic.t;          (* workers with id < allowed may start a block *)
-  busy : bool Atomic.t;            (* one worker samples at a time *)
-  next_sample : float Atomic.t;
-  mutable overhead : int;
-  mutable last_rss : int;          (* highest RSS seen at a sample *)
-  log : bool;
-}
-
-let governor_sample g =
-  let now = Unix.gettimeofday () in
-  if now >= Atomic.get g.next_sample && Atomic.compare_and_set g.busy false true then begin
-    Atomic.set g.next_sample (now +. 0.2);
-    let rss = rss_mb () in
-    let heap = (Gc.quick_stat ()).heap_words * 8 / 1048576 in   (* all domains *)
-    let grew = rss > g.last_rss + 32 in
-    g.last_rss <- max g.last_rss rss;
-    let a = Atomic.get g.allowed in
-    (* RSS is a high-water mark (OCaml 5 keeps freed pool memory mapped), so
-       pressure means: above budget and still growing, or the GC heap itself
-       close to the budget.  Relief is judged on the GC heap: well below the
-       budget means the memory already mapped has room to be reused. *)
-    let pressure = (rss > g.budget_mb && grew) || heap > g.budget_mb * 9 / 10 in
-    let headroom = max 0 (g.budget_mb - g.base_heap) in
-    let relief = heap < g.base_heap + headroom * 6 / 10 && not grew in
-    let a', o' =
-      if pressure then max 1 (a - 1), max g.min_overhead (g.overhead * 2 / 3)
-      else if relief then min g.max_jobs (a + 1), min g.base_overhead (g.overhead * 3 / 2 + 1)
-      else a, g.overhead in
-    if o' <> g.overhead then begin
-      g.overhead <- o';
-      Gc.set { (Gc.get ()) with space_overhead = o' }
-    end;
-    if a' <> a then Atomic.set g.allowed a';
-    if g.log && (a' <> a || o' <> g.overhead || pressure) then
-      Printf.eprintf "memlog governor rss=%dMB heap=%dMB budget=%dMB domains=%d space_overhead=%d\n%!"
-        rss heap g.budget_mb a' g.overhead;
-    Atomic.set g.busy false
-  end
-
-let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_overhead = 40)
-    ?(log = false) (env : Env.t) =
+(* Blocks are handed out in file order to [jobs] domains from one counter.
+   Nothing about scheduling, timing or memory changes what is checked: a block
+   sees only the constants of blocks before it (Tc.find_global), and the
+   verdict is the first failing block in file order. *)
+let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) (env : Env.t) =
   Hc.frozen := true;
   let bi = builtins env in
   let nb = Array.length env.blocks in
@@ -328,44 +254,18 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_ove
   let internal = Array.make nb false in
   let timing = Sys.getenv_opt "O4L_TIMES" <> None in
   let next = Atomic.make 0 in
-  (* Index of the first block known to be rejected.  The verdict is the first
-     failing block in file order, so blocks after it are never started: they
-     cannot change the verdict, and they may read declarations that were never
-     verified (a rejected inductive's bogus recursor can make a later proof
-     diverge or exhaust memory instead of letting the checker answer "reject").
-     Blocks before it always run, so the reported failure is the same for any
-     number of domains. *)
+  (* Index of the first block known to be rejected.  Blocks after it are never
+     started: they cannot change the verdict, and they may read declarations
+     that were never verified (a rejected inductive's bogus recursor can make
+     a later proof diverge or exhaust memory instead of letting the checker
+     answer "reject").  Blocks before it always run, so the reported failure
+     is the same for any number of domains. *)
   let reject_at = Atomic.make max_int in
   let rec note_reject i =
     let cur = Atomic.get reject_at in
     if i < cur && not (Atomic.compare_and_set reject_at cur i) then note_reject i in
-  (* Overhead floor: the largest overhead (at most [min_overhead]) whose
-     steady heap, base_heap * (1 + o/100), fits in 3/4 of the budget, but
-     never below 10.  When the floor is above the size-based policy the
-     checking starts at the floor: more memory that is available anyway, less
-     re-marking of the environment. *)
-  let base_heap = (Gc.quick_stat ()).heap_words * 8 / 1048576 in
-  let governed = budget_mb < max_int in
-  let floor =
-    if not governed || base_heap <= 0 then min_overhead
-    else max 10 (min min_overhead (100 * (budget_mb * 3 / 4 - base_heap) / base_heap)) in
-  let base_overhead =
-    let o = (Gc.get ()).space_overhead in
-    if governed && o < floor then (Gc.set { (Gc.get ()) with space_overhead = floor }; floor) else o in
-  if log then Printf.eprintf "memlog governor-start base_heap=%dMB budget=%dMB floor=%d overhead=%d\n%!"
-      base_heap budget_mb floor base_overhead;
-  let g = { budget_mb; base_heap; base_overhead; min_overhead = min base_overhead floor; max_jobs = max 1 jobs;
-            allowed = Atomic.make (max 1 jobs); busy = Atomic.make false;
-            next_sample = Atomic.make 0.0; overhead = (Gc.get ()).space_overhead; last_rss = 0; log } in
-  let worker w () =
+  let worker () =
     let rec loop () =
-      if governed then begin
-        governor_sample g;
-        (* paused while the governor allows fewer domains (worker 0 never is) *)
-        while w >= Atomic.get g.allowed && Atomic.get next < nb do
-          Unix.sleepf 0.05; governor_sample g
-        done
-      end;
       let i = Atomic.fetch_and_add next 1 in
       if i < nb && i > Atomic.get reject_at then loop ()
       else if i < nb then begin
@@ -385,10 +285,10 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_ove
         loop ()
       end in
     loop () in
-  if jobs <= 1 then worker 0 ()
+  if jobs <= 1 then worker ()
   else begin
-    let ds = List.init (jobs - 1) (fun k -> Domain.spawn (worker (k + 1))) in
-    worker 0 ();
+    let ds = List.init (jobs - 1) (fun _ -> Domain.spawn worker) in
+    worker ();
     List.iter Domain.join ds
   end;
   if timing then begin
