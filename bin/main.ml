@@ -134,18 +134,24 @@ let main () =
   end;
   let t1 = Unix.gettimeofday () in
   (* measured on an 827 MB export with this policy forced: overhead 25 gives a
-     peak RSS of 2.1x the input (1.77 GB) for ~30% more check time *)
+     peak RSS of 2.1x the input (1.77 GB) for ~30% more check time.  Every
+     major cycle marks the whole environment, so GC work grows as 1/overhead;
+     when the budget leaves room, Check raises it to a floor of up to
+     O4L_MIN_OVERHEAD (default 40), see its governor. *)
+  let min_overhead = env_int "O4L_MIN_OVERHEAD" 40 in
   let overhead = env_int "O4L_SPACE_OVERHEAD" (if input_mb <= 1024 then 120 else max 25 (120 * 1024 / input_mb)) in
   if !stats then Printf.eprintf "space_overhead while checking: %d\n%!" overhead;
   Gc.set { gc0 with space_overhead = overhead };
-  (* Memory budget for the governor (see Check): 60% of the cgroup limit or of
-     physical memory; O4L_MEM_BUDGET_MB overrides, 0 disables. *)
+  (* Memory budget for the governor (see Check): 80% of the cgroup limit or of
+     physical memory (the official kernel itself peaks at 10.7 GB on the
+     arena's 16 GB runner for Mathlib); O4L_MEM_BUDGET_MB overrides, 0
+     disables. *)
   let budget_mb =
     let read_int f = try let ic = open_in f in let l = input_line ic in close_in ic; int_of_string (String.trim l) with _ -> 0 in
     let cgroup = read_int "/sys/fs/cgroup/memory.max" / 1048576 in
     let total = proc_meminfo_mb "MemTotal:" in
     let phys = if cgroup > 0 && (total = 0 || cgroup < total) then cgroup else total in
-    match env_int "O4L_MEM_BUDGET_MB" (if phys > 0 then phys * 6 / 10 else 0) with 0 -> max_int | b -> b in
+    match env_int "O4L_MEM_BUDGET_MB" (if phys > 0 then phys * 8 / 10 else 0) with 0 -> max_int | b -> b in
   if !stats then Printf.eprintf "memory budget: %d MB\n%!" budget_mb;
   if !stats then Printf.eprintf "expr table: %s\n%!" (Kernel.Expr.H.global_stats ());
   let ndecls = Kernel.Name.Tbl.length env.consts in
@@ -155,7 +161,7 @@ let main () =
         (String.concat ", " (List.map Kernel.Name.to_string (Kernel.Env.block_names env.blocks.(i)))) m in
   phase "check-start";
   memprof_start ();
-  let r = Kernel.Check.run ~jobs:!jobs ~on_error ~budget_mb ~log:memlog env in
+  let r = Kernel.Check.run ~jobs:!jobs ~on_error ~budget_mb ~min_overhead ~log:memlog env in
   phase "check-end";
   memprof_report ();
   Kernel.Ctr.report stderr;
