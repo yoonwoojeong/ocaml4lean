@@ -100,7 +100,7 @@ module ETbl = Hashtbl.Make (struct
 module PairSet = Hashtbl.Make (struct
     type t = int * int
     let equal ((a : int), (b : int)) (c, d) = a = c && b = d
-    let hash (a, b) = Hc.mix a b
+    let hash (a, b) = Hc.mix (Hc.mix 0x9E3779B9 a) b   (* [mix a b] collides for nearby ids *)
   end)
 
 type st = {
@@ -108,6 +108,8 @@ type st = {
   mutable next : int;                  (* ids of neutrals, locals, substitutions, contexts *)
   mutable fuel : int;
   mutable eager : bool;
+  mutable rdepth : int;                (* nesting of whnf / conversion calls *)
+  counts : int array;
   delta : value KTbl.t;                (* unfolded constant bodies *)
   ctype : value KTbl.t;                (* constant types *)
   subs : sub KTbl.t;
@@ -118,14 +120,36 @@ type st = {
 }
 
 let fresh_id st = st.next <- st.next + 1; st.next
+(* work counters (O4L_NBE_STATS): evals, neutrals, thunks, forces, conv, quick-same hits,
+   whnf, whnf_core, unfolds, type_of, infer, iota *)
+let ncounters = 12
+let counter_names = [| "eval"; "neutral"; "thunk"; "force"; "conv"; "same-hit"; "whnf"; "whnf_core";
+                       "unfold"; "type_of"; "infer"; "iota" |]
+let totals = Array.init ncounters (fun _ -> Atomic.make 0)
+let stats_on = Sys.getenv_opt "O4L_NBE_STATS" <> None
+let cnt (st : st) i = if stats_on then st.counts.(i) <- st.counts.(i) + 1
+(* terms smaller than this are evaluated / inferred without memoisation *)
+let memo_size = match Sys.getenv_opt "O4L_NBE_MEMO" with Some v -> int_of_string v | None -> 8
 let depth = ref 0
 let dbg = Sys.getenv_opt "O4L_NBE_DBG" <> None
+
+(* Deep recursion is quadratic under OCaml 5 (every minor collection scans
+   the whole stack) and a sign of a reduction Tc would avoid; beyond this
+   depth the declaration is left to Tc.  [rdepth] is not restored when an
+   exception escapes: any exception ends the declaration's check. *)
+let max_depth = match Sys.getenv_opt "O4L_NBE_DEPTH" with Some v -> int_of_string v | None -> 1500
+
+let enter st =
+  st.rdepth <- st.rdepth + 1;
+  if st.rdepth > max_depth then decline "recursion depth"
+let leave st = st.rdepth <- st.rdepth - 1
 
 let tick st =
   st.fuel <- st.fuel - 1;
   if st.fuel <= 0 then decline "fuel"
 
 let mk_neu st head rargs nargs nopen =
+  cnt st 1;
   VNeu { nid = fresh_id st; head; rargs; nargs; nopen; whnf_c = dummy; whnf_f = dummy; nty = dummy }
 
 let const_val st n ls = mk_neu st (HConst (n, ls)) [] 0 false
@@ -160,7 +184,7 @@ let rec eval st env sub e : value =
   | StrLit { s; _ } -> VStr s
   | FVar _ -> decline "free variable"
   | _ ->
-    if closed e then begin
+    if closed e && size e >= memo_size then begin
       let key = (e, sub.sid) in
       match ETbl.find_opt st.evals key with
       | Some v -> v
@@ -168,13 +192,20 @@ let rec eval st env sub e : value =
     end else eval_node st env sub e
 
 and eval_node st env sub e =
+  cnt st 0;
   match e with
   | Sort { l; _ } -> VSort (inst_level sub l)
   | Const { n; ls; _ } -> const_val st n (inst_levels sub ls)
   | App _ ->
     let f, args = get_app_args e in
     let fv = eval st env sub f in
-    Array.fold_left (fun v a -> apply st v (mk_thunk st env sub a)) fv args
+    (match fv with
+     | VNeu n ->
+       (* one neutral for the whole spine *)
+       let r = ref n.rargs and o = ref n.nopen in
+       Array.iter (fun a -> let t = mk_thunk st env sub a in r := t :: !r; o := !o || t.topen) args;
+       mk_neu st n.head !r (n.nargs + Array.length args) !o
+     | _ -> Array.fold_left (fun v a -> apply st v (mk_thunk st env sub a)) fv args)
   | Lam { ty; b; _ } -> VLam (mk_thunk st env sub ty, { cenv = env; csub = sub; cbody = b })
   | Pi { ty; b; _ } -> VPi (mk_thunk st env sub ty, { cenv = env; csub = sub; cbody = b })
   | Let { v; b; _ } -> eval st (push env (mk_thunk st env sub v)) sub b
@@ -189,12 +220,14 @@ and mk_thunk st env sub e =
   | NatLit { n; _ } -> of_value (VNat n)
   | _ ->
     let c = closed e in
+    cnt st 2;
     { tv = dummy; tenv = (if c then empty_env else env); tsub = sub; tterm = e;
       topen = (not c) && env.eopen }
 
 and force st t =
   if t.tv != dummy then t.tv
   else begin
+    cnt st 3;
     let v = eval st t.tenv t.tsub t.tterm in
     t.tv <- v; t.tenv <- empty_env; v
   end
@@ -254,7 +287,7 @@ let delta_value st (ci : cinfo) ls =
     KTbl.add st.delta (n, ls) v; v
 
 let unfold st v = match v, delta_info st v with
-  | VNeu ({ head = HConst (_, ls); _ } as n), Some ci -> Some (apply_spine st (delta_value st ci ls) n)
+  | VNeu ({ head = HConst (_, ls); _ } as n), Some ci -> cnt st 8; Some (apply_spine st (delta_value st ci ls) n)
   | _ -> None
 
 let is_const_app v name = match v with
@@ -281,6 +314,7 @@ let rec whnf_core ?(cheap = false) st v =
   | VNeu n ->
     if (not cheap) && n.whnf_c != dummy then n.whnf_c
     else begin
+      cnt st 7;
       let r = match n.head with
         | HLocal _ -> v
         | HProj (s, i, sv) ->
@@ -325,6 +359,7 @@ and quot_reduce st ci n =
   end
 
 and iota st ci r ls n =
+  cnt st 11;
   let { rnparams = nparams; nmotives; nminors; rnindices = nindices; rules; k; _ } = r in
   let major_idx = nparams + nmotives + nminors + nindices in
   if major_idx >= n.nargs then None else begin
@@ -408,8 +443,10 @@ and nat_lit_ext st v = match v with
   | VNeu { head = HConst (n, []); nargs = 0; _ } when n == Tc.N.nat_zero || Name.equal n Tc.N.nat_zero -> Some Z.zero
   | _ -> None
 
+(* As in Lean's type_checker::reduce_nat, terms with free variables (here:
+   values that may mention a local) are not reduced by the Nat extension. *)
 and reduce_nat st v =
-  if not st.tc.Tc.bi.nat_ok then None else
+  if (not st.tc.Tc.bi.nat_ok) || vopen v then None else
     match v with
     | VNeu ({ head = HConst (n, []); _ } as nu) ->
       if nu.nargs = 1 && (n == Tc.N.nat_succ || Name.equal n Tc.N.nat_succ) then
@@ -473,7 +510,9 @@ and whnf st v =
           match unfold st t1 with
           | Some t' -> loop t'
           | None -> t1 in
+      enter st; cnt st 6;
       let r = loop v in
+      leave st;
       n.whnf_f <- r; r
     end
   | _ -> v
@@ -491,6 +530,7 @@ and type_of st v : value =
   | VNeu n ->
     if n.nty != dummy then n.nty
     else begin
+      cnt st 9;
       let h = match n.head with
         | HConst (c, ls) -> const_type st c ls
         | HLocal l -> l.lty
@@ -585,7 +625,7 @@ and same_env st e1 e2 fuel =
    go e1.vals e2.vals)
 
 and quick st t s : int =
-  if same st t s (ref 256) then 1 else
+  if same st t s (ref 256) then (cnt st 5; 1) else
   match t, s with
   | VSort a, VSort b -> if Level.is_equiv a b then 1 else 0
   | VNat a, VNat b -> if Z.equal a b then 1 else 0
@@ -619,7 +659,16 @@ and conv st t s =
 
 and conv_main st t s =
   begin
+    cnt st 4;
     tick st;
+    enter st;
+    let res = conv_main1 st t s in
+    leave st;
+    res
+  end
+
+and conv_main1 st t s =
+  begin
     let r = quick st t s in
     if r >= 0 then r = 1 else begin
       let r = conv_core st t s in
@@ -874,6 +923,7 @@ let rec infer st cx e : value =
      | _ -> ());
     List.iter (check_level st) ls;
     const_type st n ls
+  | _ when size e < memo_size -> infer_node st cx e
   | _ ->
     let key = (e, if closed e then 0 else cx.cid) in
     match ETbl.find_opt st.infers key with
@@ -883,6 +933,7 @@ let rec infer st cx e : value =
       ETbl.add st.infers key t; t
 
 and infer_node st cx e =
+  cnt st 10;
   match e with
   | App _ ->
     let f, args = get_app_args e in
@@ -1000,7 +1051,7 @@ and infer_proj st cx sname idx se =
 let fuel = match Sys.getenv_opt "O4L_NBE_FUEL" with Some v -> int_of_string v | None -> 20_000_000
 
 let create tc = {
-  tc; next = 0; fuel; eager = false;
+  tc; next = 0; fuel; eager = false; rdepth = 0; counts = Array.make 12 0;
   delta = KTbl.create 64; ctype = KTbl.create 64; subs = KTbl.create 16;
   evals = ETbl.create 256; infers = ETbl.create 256;
   success = PairSet.create 64; failure = PairSet.create 16;
@@ -1011,8 +1062,17 @@ let create tc = {
    safety of the declaration. *)
 let check_decl (tc : Tc.ctx) (ci : cinfo) v =
   let st = create tc in
-  let ty = eval st empty_env id_sub ci.ty in
-  check st empty_cx v ty
+  let fin () = if stats_on then Array.iteri (fun i c -> ignore (Atomic.fetch_and_add totals.(i) c)) st.counts in
+  match
+    let ty = eval st empty_env id_sub ci.ty in
+    check st empty_cx v ty
+  with
+  | () -> fin ()
+  | exception e -> fin (); raise e
+
+let print_stats () =
+  if stats_on then
+    Array.iteri (fun i n -> Printf.eprintf "nbe-count %-10s %d\n" n (Atomic.get totals.(i))) counter_names
 
 (* counters, for --stats *)
 let accepted = Atomic.make 0

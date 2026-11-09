@@ -145,6 +145,7 @@ let main () =
     if Kernel.Check.use_nbe then
       Printf.eprintf "nbe: accepted %d, declined %d, other fallbacks %d\n"
         (Atomic.get Kernel.Nbe.accepted) (Atomic.get Kernel.Nbe.declines) (Atomic.get Kernel.Nbe.fallbacks);
+    Kernel.Nbe.print_stats ();
     Printf.eprintf "global hash-cons tables: exprs %d, levels %d, names %d\n"
       (Kernel.Expr.H.global_size ()) (Kernel.Level.H.global_size ()) (Kernel.Name.H.global_size ())
   end;
