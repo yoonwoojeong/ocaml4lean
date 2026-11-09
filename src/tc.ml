@@ -290,25 +290,39 @@ and infer_pi c e infer_only =
 
 and infer_app c e infer_only =
   if not infer_only then begin
-    match e with
-    | App { f; a; _ } ->
-      let f_type = ensure_pi c (infer_core c f false) in
-      let a_type = infer_core c a false in
-      (match f_type with
-       | Pi { ty = d_type; b; _ } ->
-         let ok =
-           if is_app_of a N.eager_reduce && get_app_num_args a = 2 then begin
-             let saved = c.eager in
-             c.eager <- true;
-             let r = (try is_def_eq c a_type d_type with ex -> c.eager <- saved; raise ex) in
-             c.eager <- saved; r
-           end else is_def_eq c a_type d_type in
-         if not ok then
-           fail "application type mismatch: argument %s has type %s but is expected to have type %s"
-             (to_string ~max:300 a) (to_string ~max:300 a_type) (to_string ~max:300 d_type);
-         instantiate1 b a
-       | _ -> assert false)
-    | _ -> assert false
+    (* The whole spine f a0 .. a(n-1) at once.  Each argument's type is compared
+       with the domain of the function type instantiated with the earlier
+       arguments; the domain is instantiated alone and the body once at the end,
+       instead of instantiating the remaining telescope after every argument
+       (n traversals of the function type).  Substitution commutes with Pi, so
+       every definitional-equality check sees the same terms as one node at a
+       time would.  Args j..i-1 are pending: substituted into [f_type] lazily. *)
+    let f, args = get_app_args e in
+    let nargs = Array.length args in
+    let f_type = ref (infer_core c f false) and j = ref 0 in
+    for i = 0 to nargs - 1 do
+      let pi = match !f_type with
+        | Pi _ as p -> p
+        | t -> let p = ensure_pi c (instantiate_args t args !j i) in j := i; p in
+      match pi with
+      | Pi { ty; b; _ } ->
+        let d_type = instantiate_args ty args !j i in
+        let a = args.(i) in
+        let a_type = infer_core c a false in
+        let ok =
+          if is_app_of a N.eager_reduce && get_app_num_args a = 2 then begin
+            let saved = c.eager in
+            c.eager <- true;
+            let r = (try is_def_eq c a_type d_type with ex -> c.eager <- saved; raise ex) in
+            c.eager <- saved; r
+          end else is_def_eq c a_type d_type in
+        if not ok then
+          fail "application type mismatch: argument %s has type %s but is expected to have type %s"
+            (to_string ~max:300 a) (to_string ~max:300 a_type) (to_string ~max:300 d_type);
+        f_type := b
+      | _ -> assert false
+    done;
+    instantiate_args !f_type args !j nargs
   end else begin
     let f, args = get_app_args e in
     let f_type = ref (infer_core c f true) in

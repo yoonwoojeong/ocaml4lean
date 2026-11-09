@@ -68,9 +68,13 @@ module H = Hc.Make (struct
 let mix = Hc.mix
 let gbit () = if !Hc.frozen then 0 else 4
 let mk_info ~fv ~lp ~lbr = (lbr lsl 11) lor 8 lor (if fv then 1 else 0) lor (if lp then 2 else 0) lor gbit ()
+(* int-specialised: without flambda, [Stdlib.min]/[max] are polymorphic and call
+   the C [compare] for every node built (measured: ~2.5% of Init check time) *)
+let imin (a : int) b = if a <= b then a else b
+let imax (a : int) b = if a >= b then a else b
 let union a b =
-  let sz = min 255 (((a lsr 3) land 255) + ((b lsr 3) land 255) + 1) in
-  (max (a lsr 11) (b lsr 11) lsl 11) lor (sz lsl 3) lor ((a lor b) land 3) lor gbit ()
+  let sz = imin 255 (((a lsr 3) land 255) + ((b lsr 3) land 255) + 1) in
+  (imax (a lsr 11) (b lsr 11) lsl 11) lor (sz lsl 3) lor ((a lor b) land 3) lor gbit ()
 (* info of a binder body: loose range decreases by one *)
 let under i = let r = i lsr 11 in ((if r > 0 then r - 1 else 0) lsl 11) lor (i land 2043)
 let g2 a b = info a land info b land 4 <> 0
@@ -341,26 +345,69 @@ end
    promotion of many short-lived cache cells. *)
 let migrate_at = (match Sys.getenv_opt "O4L_MIGRATE" with Some v -> int_of_string v | None -> 256)
 module MemoH = struct
-  type c = { kind : int; mutable small : t Tbl2.t; mutable big : Memo.m option }
-  let get_for (_ : t) k = { kind = k; small = Tbl2.create 16; big = None }
+  (* The small table is open addressing over four fresh arrays, allocated on
+     the first insert (traversals that never memoise allocate nothing).  Keys
+     are compared by identity and offset, without allocating a tuple or calling
+     a closure.  Arrays stay at most [Max_young_wosize] (256) words, so they are
+     allocated in the minor heap and stores into them need no write barrier
+     work; past 3/4 of that the table moves to the reusable flat memo. *)
+  type c = { kind : int; mutable hs : int array; mutable offs : int array; mutable ks : t array;
+             mutable vs : t array; mutable n : int; mutable mask : int; mutable big : Memo.m option }
+  let max_cap = 256
+  let get_for (_ : t) k = { kind = k; hs = [||]; offs = [||]; ks = [||]; vs = [||]; n = 0; mask = -1; big = None }
   let find c e off = match c.big with
     | Some m -> Memo.find m e off
-    | None -> Tbl2.find c.small (e, off)
+    | None ->
+      if c.n = 0 then raise Not_found;
+      let h = Memo.key e off and mask = c.mask and hs = c.hs in
+      let rec go i =
+        let x = Array.unsafe_get hs i in
+        if x = 0 then raise Not_found
+        else if x = h && Array.unsafe_get c.ks i == e && Array.unsafe_get c.offs i = off
+        then Array.unsafe_get c.vs i
+        else go ((i + 1) land mask) in
+      go (h land mask)
+  let rec slot hs mask i = if Array.unsafe_get hs i = 0 then i else slot hs mask ((i + 1) land mask)
+  let resize c cap =
+    let hs = Array.make cap 0 and offs = Array.make cap 0 and ks = Array.make cap Memo.dummy
+    and vs = Array.make cap Memo.dummy and mask = cap - 1 in
+    for i = 0 to c.mask do
+      let h = Array.unsafe_get c.hs i in
+      if h <> 0 then begin
+        let j = slot hs mask (h land mask) in
+        Array.unsafe_set hs j h; Array.unsafe_set offs j (Array.unsafe_get c.offs i);
+        Array.unsafe_set ks j (Array.unsafe_get c.ks i); Array.unsafe_set vs j (Array.unsafe_get c.vs i)
+      end
+    done;
+    c.hs <- hs; c.offs <- offs; c.ks <- ks; c.vs <- vs; c.mask <- mask
   let add c e off v = match c.big with
     | Some m -> Memo.add m e off v
     | None ->
-      Tbl2.add c.small (e, off) v;
-      if Tbl2.length c.small > migrate_at then begin
+      if 4 * (c.n + 1) > 3 * max_cap then begin
         let m = Memo.get c.kind in
-        Tbl2.iter (fun (e, off) v -> Memo.add m e off v) c.small;
-        c.big <- Some m; c.small <- Tbl2.create 1
+        for i = 0 to c.mask do
+          if Array.unsafe_get c.hs i <> 0 then
+            Memo.add m (Array.unsafe_get c.ks i) (Array.unsafe_get c.offs i) (Array.unsafe_get c.vs i)
+        done;
+        Memo.add m e off v;
+        c.big <- Some m; c.hs <- [||]; c.offs <- [||]; c.ks <- [||]; c.vs <- [||]
+      end else begin
+        if c.mask < 0 then resize c 16
+        else if 4 * (c.n + 1) > 3 * (c.mask + 1) then resize c (2 * (c.mask + 1));
+        let h = Memo.key e off in
+        let j = slot c.hs c.mask (h land c.mask) in
+        Array.unsafe_set c.hs j h; Array.unsafe_set c.offs j off;
+        Array.unsafe_set c.ks j e; Array.unsafe_set c.vs j v;
+        c.n <- c.n + 1
       end
 end
 
-(* Only subterms of at least this (tree) size are memoised: smaller ones are
-   cheaper to rebuild than to look up, and exponential blow-up through DAG
-   sharing can only come from large shared subterms. *)
-let memo_min = (match Sys.getenv_opt "O4L_MEMO_MIN" with Some v -> int_of_string v | None -> 0)
+(* Only subterms of at least this tree size are memoised: smaller ones are
+   cheaper to rebuild than to look up (a probe and an insert per node), and
+   rebuilding one costs at most [memo_min] steps per occurrence, so DAG sharing
+   cannot blow up.  Measured on Init (1 domain): 0 -> 8 cuts check time 9%;
+   16 and 32 are within noise of 8. *)
+let memo_min = (match Sys.getenv_opt "O4L_MEMO_MIN" with Some v -> int_of_string v | None -> 8)
 
 (* lift loose bvars >= s by d *)
 let lift_loose e s d =

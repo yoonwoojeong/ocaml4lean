@@ -210,6 +210,87 @@ work.
   loose-bound-variable ranges could not be trusted anyway. A blean reader is not worth
   its code.
 
+## Third round: profiling-driven
+
+This round started from measurements of the current code rather than from other
+kernels. Baseline e2fb600, OCaml 5.4.0, raw data in
+`bench/results/profiling-round-3.txt`.
+
+| workload | before: check | after: check | peak RSS |
+|---|---:|---:|---:|
+| Init, 1 domain | 49.1 s | **34.9 s** (−29%) | 1.31 → 1.32 GB |
+| Init, 4 domains | 13.9 s | **10.4 s** (−25%) | 1.35 → 1.35 GB |
+| Std, 4 domains | 24.0 s | **18.6 s** (−22%) | 1.92 → 1.92 GB |
+| Lean, 4 domains | 29.2 s | **21.8 s** (−25%) | 2.90 → 2.87 GB |
+| perf: magma-n7, grind-ring-5, app-lam, beta-ladder | 3.07, 1.98, 8.58, 2.17 s | 2.51, 1.51, 7.74, 1.66 s | same |
+| Mathlib proxy (6.2 GB), 4 domains | 436 s total¹ | **284 s** total (parse 104 s + check 180 s) | 8.16 → 8.85 GB |
+
+¹ The last proxy measurement, made with round 2's session caches but without its
+parser change. The proxy's peak RSS rose 8%, while the GC's own top heap rose only 2%
+(6.71 → 6.85 GB). The peak is still below the governor's budget (9.65 GB here), and
+all 1,056,596 declarations are accepted.
+
+**Tools.** Each investigation used the cheapest tool that answers its question.
+Timings were always taken in separate runs, without a profiler.
+* **`perf record -F 499`, flat.** Shows where the time goes, at negligible overhead.
+  A `-g` build only adds debug info, which turns the numbered OCaml symbols (`go_1943`)
+  into source lines.
+* **`perf record --call-graph dwarf` at 97 Hz, with `bench/perfcallers.py`.** The script
+  groups samples by hot function and its nearest callers, skipping runtime trampolines
+  and recursion. It shows who calls `Hashtbl`, `compare_val` or the substitution
+  traversals.
+* **`O4L_COUNTERS=1`.** Counts how often something happens: substitutions and nodes, and,
+  as temporary sites never committed, array allocations and hash-cons lookups.
+* **`O4L_MEMPROF=RATE` (new, in `bin/main.ml`).** `Gc.Memprof` samples allocations during
+  checking and reports, by call site, those that were promoted to the major heap. It
+  costs one getenv when unset; at `1e-4` the run is about 14% slower, which is why it
+  is used only to read the report, never for timing.
+* **The VM has no hardware counters.** So A/B comparisons were interleaved runs of
+  both binaries, three where the difference was small.
+
+**Changes kept** (Init on 1 domain, check time, interleaved runs):
+1. **Int-specialised `min`/`max` in the node-info combiner** (48.5 → 45.1 s). `perf`
+   showed `compare_val` reached through `caml_lessequal`/`caml_greaterequal`. Without
+   flambda, `Stdlib.min`/`max` are polymorphic, so every node built during checking
+   called the C comparison twice.
+2. **Substitution memo without `Hashtbl`** (Init neutral; app-lam −10%, beta-ladder
+   −22%). The small per-traversal table was a `Hashtbl.Make` keyed by a
+   `(node, offset)` tuple: 8% of time in `seeded_hash`, `key_index`, `find`, closure
+   calls and resizing. It is now open addressing over four fresh arrays, compared by
+   identity, allocated on the first insert. A first version that packed pairs into two
+   arrays was 9% *slower* on Init: its arrays passed 256 words, and arrays that large
+   are allocated directly in the major heap, so the table moved out of the minor heap.
+   The arrays now stay at or below that size.
+3. **Memoise only subterms of tree size ≥ 8** (−9%, 44.9 → 40.5 s). Every node of every
+   substitution had paid a probe and an insert. A subterm smaller than the threshold is
+   rebuilt in at most 8 steps per occurrence, so DAG sharing cannot blow up. Thresholds
+   16 and 32 are within noise of 8.
+4. **Batched application checking** (−10%, 40.5 → 36.6 s). Profiling with callers
+   showed `instantiate1` called from `infer_app`. In checking mode each application
+   node instantiated the whole remaining Pi telescope with its argument, so a spine of
+   n arguments traversed the function type n times. The spine is now checked at once:
+   each argument's type is compared with the domain instantiated with the earlier
+   arguments, and the body is instantiated once at the end. This is how the infer-only
+   path already worked. Substitution commutes with Pi, so every def-eq check sees the
+   same terms as before.
+
+**Measured and dropped:**
+* **Array literals instead of `Array.make`.** Counters showed `get_app_args` called
+  33 M times (3.7 arguments on average) and 15.7 M small-memo allocations. Literals,
+  which OCaml allocates inline, changed nothing measurable.
+* **More GC space overhead.** 120 → 400 gives −4% check time for 2.3× the RSS.
+* **A larger minor heap.** Up to 16 M words, promotion falls only from 490 to 446 M
+  words and checking gets slower. `O4L_MEMPROF` explains why: about 95% of what is
+  promoted is expression nodes built by substitution and kept in the caches. These are
+  genuinely long-lived, not GC churn.
+* **Hash-cons lookups while checking** (6.8%). 73% of the 48.7 M lookups hit, keeping
+  results canonical, which session caching and pointer-equality checks rely on, so
+  they stay.
+
+What remains: substitution (14%), major GC (about 15%, dominated by marking the
+environment) and hash-cons lookups (7%). The next step would be fewer substitutions,
+not cheaper ones.
+
 ## Comparison with nanoda, con-leche and con-ron
 
 Not measured. Building them (Rust/Lean projects from GitHub) was blocked by the

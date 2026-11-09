@@ -41,6 +41,44 @@ let phase tag =
   end
 
 let parse_only = ref false
+(* Opt-in allocation profile of the checking phase (O4L_MEMPROF=RATE, e.g. 1e-4):
+   Gc.Memprof samples allocations at RATE per word; at exit the sampled
+   allocations that survived into the major heap are grouped by their innermost
+   call sites.  For analysis only: build with -g for source locations, and use
+   -j 1 (a profile follows the domain that starts it).  Unset, it costs one
+   getenv. *)
+let memprof_rate = Option.map float_of_string (Sys.getenv_opt "O4L_MEMPROF")
+let memprof_promoted = ref [] and memprof_samples = ref 0
+let memprof_start () =
+  match memprof_rate with
+  | None -> ()
+  | Some rate ->
+    let tracker = { Gc.Memprof.null_tracker with
+                    alloc_minor = (fun (i : Gc.Memprof.allocation) -> incr memprof_samples; Some (i.size, i.callstack));
+                    promote = (fun x -> memprof_promoted := x :: !memprof_promoted; None) } in
+    ignore (Gc.Memprof.start ~sampling_rate:rate ~callstack_size:12 tracker)
+let memprof_report () =
+  if memprof_rate <> None then begin
+    Gc.Memprof.stop ();
+    let site cs =
+      match Printexc.backtrace_slots cs with
+      | None -> "?"
+      | Some slots ->
+        let locs = Array.to_list slots |> List.filter_map (fun s ->
+            match Printexc.Slot.location s with
+            | Some l -> Some (Printf.sprintf "%s:%d" (Filename.basename l.filename) l.line_number)
+            | None -> None) in
+        let rec take k = function x :: r when k > 0 -> x :: take (k - 1) r | _ -> [] in
+        String.concat " < " (take 4 locs) in
+    let tbl = Hashtbl.create 64 in
+    List.iter (fun (sz, cs) -> let k = site cs in
+                let (n, w) = try Hashtbl.find tbl k with Not_found -> (0, 0) in
+                Hashtbl.replace tbl k (n + 1, w + sz)) !memprof_promoted;
+    let l = List.sort (fun (_, (a, _)) (_, (b, _)) -> compare b a) (Hashtbl.fold (fun k v acc -> (k, v) :: acc) tbl []) in
+    Printf.eprintf "memprof: %d sampled allocations, %d promoted\n" !memprof_samples (List.length !memprof_promoted);
+    List.iteri (fun i (k, (n, w)) -> if i < 25 then Printf.eprintf "memprof %6d promoted (%7d words)  %s\n" n w k) l
+  end
+
 let main () =
   let jobs = ref 1 and file = ref "" and stats = ref false and quiet = ref false in
   let spec = [
@@ -116,8 +154,10 @@ let main () =
       Printf.eprintf "error in block %d (%s): %s\n%!" i
         (String.concat ", " (List.map Kernel.Name.to_string (Kernel.Env.block_names env.blocks.(i)))) m in
   phase "check-start";
+  memprof_start ();
   let r = Kernel.Check.run ~jobs:!jobs ~on_error ~budget_mb ~log:memlog env in
   phase "check-end";
+  memprof_report ();
   Kernel.Ctr.report stderr;
   let t2 = Unix.gettimeofday () in
   (* report axioms *)
