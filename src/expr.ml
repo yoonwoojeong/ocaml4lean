@@ -274,82 +274,17 @@ module Tbl2 = Hashtbl.Make (struct
     let hash (a, i) = mix (hash a) i
   end)
 
-(* Exact memo tables keyed by (node identity, binder offset), one per domain
-   and traversal kind, reused across calls: entries live in flat arrays (no
-   per-entry allocation, hence no promotion of cache cells by the GC), and a
-   list of used slots makes clearing proportional to the previous use. *)
-module Memo = struct
-  type m = { mutable hs : int array; mutable ks : t array; mutable offs : int array; mutable vs : t array;
-             mutable n : int; mutable mask : int; mutable used : int array }
-  let dummy = BVar { hi = 0; idx = 0 }
-  let init_cap = 1024
-  let create () = { hs = Array.make init_cap 0; ks = Array.make init_cap dummy; offs = Array.make init_cap 0;
-                    vs = Array.make init_cap dummy; n = 0; mask = init_cap - 1; used = Array.make (init_cap / 2) 0 }
-  let clear m =
-    if m.n > 0 then begin
-      if m.mask + 1 > (1 lsl 16) then begin
-        m.hs <- Array.make init_cap 0; m.ks <- Array.make init_cap dummy; m.offs <- Array.make init_cap 0;
-        m.vs <- Array.make init_cap dummy; m.mask <- init_cap - 1; m.used <- Array.make (init_cap / 2) 0
-      end else
-        for k = 0 to m.n - 1 do
-          let i = Array.unsafe_get m.used k in
-          Array.unsafe_set m.hs i 0; Array.unsafe_set m.ks i dummy; Array.unsafe_set m.vs i dummy
-        done;
-      m.n <- 0
-    end
-  let key e off = ((mix (hash e) off) lor 1) land max_int
-  let find m e off =
-    let h = key e off in
-    let mask = m.mask in
-    let rec go i =
-      let x = Array.unsafe_get m.hs i in
-      if x = 0 then raise Not_found
-      else if x = h && Array.unsafe_get m.ks i == e && Array.unsafe_get m.offs i = off then Array.unsafe_get m.vs i
-      else go ((i + 1) land mask) in
-    go ((h lsr 1) land mask)
-  let rec slot hs mask h i = if Array.unsafe_get hs i = 0 then i else slot hs mask h ((i + 1) land mask)
-  let grow m =
-    let cap = 2 * (m.mask + 1) in
-    let mask = cap - 1 in
-    let hs = Array.make cap 0 and ks = Array.make cap dummy and offs = Array.make cap 0 and vs = Array.make cap dummy in
-    let used = Array.make (cap / 2) 0 in
-    for k = 0 to m.n - 1 do
-      let i = m.used.(k) in
-      let h = m.hs.(i) in
-      let j = slot hs mask h ((h lsr 1) land mask) in
-      hs.(j) <- h; ks.(j) <- m.ks.(i); offs.(j) <- m.offs.(i); vs.(j) <- m.vs.(i); used.(k) <- j
-    done;
-    m.hs <- hs; m.ks <- ks; m.offs <- offs; m.vs <- vs; m.mask <- mask; m.used <- used
-  let add m e off v =
-    if 2 * (m.n + 1) > m.mask + 1 then grow m;
-    let h = key e off in
-    let j = slot m.hs m.mask h ((h lsr 1) land m.mask) in
-    Array.unsafe_set m.hs j h; Array.unsafe_set m.ks j e; Array.unsafe_set m.offs j off; Array.unsafe_set m.vs j v;
-    Array.unsafe_set m.used m.n j;
-    m.n <- m.n + 1
-  let key_dls = Domain.DLS.new_key (fun () -> Array.init 6 (fun _ -> create ()))
-  (* traversal kinds: 0 lift, 1 lower, 2 instantiate, 3 abstract, 4 lparams *)
-  let get k = let m = (Domain.DLS.get key_dls).(k) in clear m; m
-end
-(* TEMPORARY (phase 1 measurement): O4L_TMP_MEMO=two|flat|small *)
-let tmp_mode = match Sys.getenv_opt "O4L_TMP_MEMO" with Some "flat" -> 1 | Some "small" -> 2 | _ -> 0
+(* Per-traversal memo: a fresh small hash table for each lift/lower/instantiate/
+   abstract call.  Measured on Init (phase 1, 4 vCPU): always-small 76.1 s (1 domain) /
+   28.5 s (4); the old "small, migrating to a per-domain flat Memo after 256 entries"
+   76.6 s / 28.3 s; always-flat 80.7 s / 29.4 s.  So the migration buys nothing within
+   noise and is not kept; the flat per-domain memo was not faster (large arrays in
+   the major heap cost GC scanning, docs/NBE.md), so it is not kept either. *)
 module MemoH = struct
-  type c = { kind : int; mutable small : t Tbl2.t; mutable big : Memo.m option }
-  let get_for (_ : t) k =
-    if tmp_mode = 1 then { kind = k; small = Tbl2.create 1; big = Some (Memo.get k) }
-    else { kind = k; small = Tbl2.create 16; big = None }
-  let find c e off = match c.big with
-    | Some m -> Memo.find m e off
-    | None -> Tbl2.find c.small (e, off)
-  let add c e off v = match c.big with
-    | Some m -> Memo.add m e off v
-    | None ->
-      Tbl2.add c.small (e, off) v;
-      if tmp_mode = 0 && Tbl2.length c.small > 256 then begin
-        let m = Memo.get c.kind in
-        Tbl2.iter (fun (e, off) v -> Memo.add m e off v) c.small;
-        c.big <- Some m; c.small <- Tbl2.create 1
-      end
+  type c = t Tbl2.t
+  let get_for (_ : t) (_ : int) : c = Tbl2.create 16
+  let find c e off = Tbl2.find c (e, off)
+  let add c e off v = Tbl2.add c (e, off) v
 end
 
 (* lift loose bvars >= s by d *)
