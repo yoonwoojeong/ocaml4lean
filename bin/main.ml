@@ -41,8 +41,10 @@ let main () =
      live * (1 + space_overhead / 100).  After parsing, the heap is compacted
      (the parser's garbage goes back to the OS and the live size L is known),
      and the overhead for checking is the largest value, within [25, 120], at
-     which L * (1 + o/100) stays under half of the machine's memory.  Nothing
-     is adjusted later; running out of memory is an error (exit 3). *)
+     which L * (1 + o/100) stays under 30% of the machine's memory.  The
+     margin is measured: with 4 domains the peak resident set is about 1.8x
+     that heap target (domains' working sets and garbage not yet collected).
+     Nothing is adjusted later; running out of memory is an error (exit 3). *)
   let gc0 = Gc.get () in
   Gc.set { gc0 with space_overhead = 120 };
   let input_mb = if !file = "-" then 0 else (try (Unix.stat !file).st_size / 1048576 with _ -> 0) in
@@ -61,7 +63,7 @@ let main () =
   if !parse_only then (Printf.printf "parsed\n"; exit 0);
   Gc.compact ();
   let live_mb = heap_mb () and mem_mb = memory_mb () in
-  let overhead = if mem_mb = 0 || live_mb = 0 then 120 else max 25 (min 120 (100 * (mem_mb / 2 - live_mb) / live_mb)) in
+  let overhead = if mem_mb = 0 || live_mb = 0 then 120 else max 25 (min 120 (100 * (mem_mb * 3 / 10 - live_mb) / live_mb)) in
   Gc.set { gc0 with space_overhead = overhead };
   if !stats then Printf.eprintf "after compaction: live %d MB, memory %d MB, space_overhead %d\n%!" live_mb mem_mb overhead;
   let t1 = Unix.gettimeofday () in
