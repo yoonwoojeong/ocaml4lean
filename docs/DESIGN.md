@@ -1,20 +1,17 @@
 # ocaml4lean: design
 
-Status: **draft for review.** It describes the kernel as it should be, compared
-with `main` at `6f94226`. Decisions still open are marked **[open]**.
+This document describes the kernel as it is. Every rule and every cache has a
+stated reason; code without one has been removed.
 
-## 1. Why this document
+## 1. Why it looks like this
 
-Recent work optimized one number, the arena's time, by borrowing techniques
-from other kernels piece by piece: a memory governor, then two NbE value cores
-(`docs/MEMORY.md`, `docs/NBE.md`). Each piece solved a problem of the system it
-came from and created new ones here. The fixes for those piled up as limits,
-fallbacks and environment variables. None of the NbE variants beat the current
-checker, and the governor is a feedback controller compensating for memory
-behaviour that was never designed.
-
-This document starts again from what a kernel must guarantee, and keeps only
-what that requires.
+The kernel logic (`tc.ml`, `inductive.ml`, `level.ml`) is the first version of
+this project and has not changed in substance. What was added later to chase
+benchmark time (a memory governor driven by the resident set, two NbE value
+cores, tuning environment variables, GC settings chosen by input size) has been
+removed: none of it changed a verdict, the NbE cores were not faster, and the
+governor was a feedback loop whose behaviour depended on the machine. What
+remains is one checker, one term representation, one memory rule.
 
 ## 2. Goals and non-goals
 
@@ -34,8 +31,8 @@ In priority order:
    rule and every cache has a stated reason (§5–§7). Code that has no reason
    is removed.
 5. **Performance**, as a consequence of 1–4, not a goal of its own. The target
-   is the order of the official kernel (currently 1.2–1.8× its instructions
-   outside Mathlib). Losing up to 1.5× is acceptable in exchange for 1–4.
+   is the order of the official kernel. Losing up to 1.5× is acceptable in
+   exchange for 1–4.
 
 Non-goals:
 - matching the fastest arena kernels;
@@ -161,9 +158,7 @@ rules of §6.1 to try and in what order.
 - **Same-head shortcut** (compare the arguments before unfolding): kept, as
   Lean.
 - **Caches:** see §7.
-- **Heuristics with no counterpart in Lean's kernel:** none. Today there are
-  none on `main` either; the NbE branch's bounded `same`, fuel and depth
-  limits go with the NbE code (§9).
+- **Heuristics with no counterpart in Lean's kernel:** none.
 
 Each `whnf` or `≡` call either returns or raises a resource error (stack or
 memory). There are no step limits. Like the official kernel, ocaml4lean may
@@ -171,8 +166,8 @@ diverge on inputs that diverge in Lean; the arena's timeout handles those.
 
 ## 7. Invariants
 
-Each invariant states what it guarantees, and how it is checked
-(`O4L_CHECK=1`, one debug switch, §10).
+Each invariant states what it guarantees and how it is, or is to be, checked.
+The debug-mode checks (I1–I3) are not implemented yet (§11).
 
 **I1. Global maximal sharing.** Two structurally equal terms in the global tier
 are physically equal. Consequence: for two global terms, `==` is structural
@@ -229,55 +224,48 @@ could make an open term look closed.
 
 ## 8. Resources
 
-**Cost model.** Measured on Init (`docs/NBE.md` §1; profile in the
-investigation of PR #6). About 75% of checking time goes to the substitution
-machinery and the memory it allocates:
-- rebuilding terms in `instantiate` and `instantiate_lparams`: 19%;
-- structural equality of fresh terms: 17.5%;
-- looking up new nodes in the hash-cons table: 7%;
-- GC: 26%.
+**Cost model.** Measured on Init: about 75% of checking time goes to the
+substitution machinery and the memory it allocates (rebuilding terms in
+`instantiate` and `instantiate_lparams` 19%, structural equality of fresh terms
+17.5%, hash-cons lookups 7%, GC 26%). The kernel logic itself is about 7%. This
+is the official kernel's algorithm, so parity with it is the realistic ceiling.
+Repeated `instantiate` work inside one declaration is only 8.4% of node visits
+(58% across declarations, which no per-block cache can use); an exact
+whole-call cache was slower (104.5 s against 83 s on Init), and two
+closure-based cores were at parity or worse. Improvements must come from lower
+per-step cost, never from approximations.
 
-The kernel logic itself is about 7%. That matches the official kernel's
-algorithm, which ocaml4lean follows. Improvements within this design must come
-from not doing redundant work, sharing-aware and with exact caches, and never
-from approximations. One flaw is suspected and to be verified: `Emap`, `Pset`
-and `Memo` set bit 0 of every key and also use the low bits as the slot index,
-so half the slots are never used directly and probe chains cluster.
+**Memory model.** Peak ≈ E·(1 + o/100) + N·W, where E is the live environment
+(about 0.65× the export size after hash-consing), o the GC space overhead, N
+the number of domains and W the largest working set among blocks checked at
+the same time. E dominates on Mathlib-scale input.
 
-**Memory model.** Peak ≈ E·(1 + o/100) + N·W, where:
-- E is the live environment (about the export size);
-- o is the GC space overhead while checking;
-- N is the number of domains;
-- W is the largest per-block working set among blocks checked at the same
-  time.
+**Memory rule (`bin/main.ml`), computed once.** After parsing, the heap is
+compacted and the live size L is read. The overhead for checking is the largest
+o in [25, 120] with L·(1 + o/100) at most 30% of the machine's memory (cgroup
+limit or physical). Nothing is adjusted afterwards. Running out of memory is an
+error (exit 3), never a verdict. The 30% is measured: with 4 domains the peak
+resident set is about 1.8× the heap target (a 50% target peaked at 13.3 GB on
+the 6.2 GB Mathlib proxy on a 16 GB machine).
 
-E dominates on Mathlib.
+Measured with 4 domains on 4 vCPU / 16 GB (wall time / peak resident set):
 
-**Policy: static, computed once at startup [open: validate on the Mathlib
-proxy].** Choose o from the machine's memory and E, so that E·(1 + o/100) is
-at most 60% of memory, clamped to [25, 120]. Fix N (4 in the arena). There
-is no runtime governor:
-- it changes scheduling and GC pacing based on timing;
-- it latched on the arena's Mathlib (PR #5);
-- it is a feedback loop that §2.2 rules out.
+| input | declarations | o | time | peak |
+|---|---:|---:|---:|---:|
+| Init | 66,110 | 120 | 27.4 s | 1.43 GB |
+| Std | 113,988 | 120 | 47.3 s | 1.94 GB |
+| Lean package | 207,493 | 120 | 59.5 s | 3.02 GB |
+| Mathlib proxy (6.2 GB) | 1,055,791 | 25 | 391.9 s | 8.35 GB |
 
-If the static policy cannot fit Mathlib on the arena runner, the honest
-outcome is exit 3 (out of memory), and the fix is reducing E or W by design
-(representation), not control.
+The governor it replaces took 357.8 s and 8.66 GB on the proxy. The arena's
+runner has shown about 35% more resident memory than this machine for the same
+input, which would put the proxy near 11.3 GB of its 16 GB.
 
-## 9. What to delete
+## 9. Environment variables
 
-| item | reason |
-|---|---|
-| `src/nbe.ml`, `src/nbh.ml`, `O4L_NBE*`, the hooks in `check.ml` | no performance benefit (`docs/NBE.md`); a second checker breaks "one path" |
-| memory governor (`Check.governor_*`, `O4L_MEM_BUDGET_MB`, `O4L_MIN_OVERHEAD`) | feedback control (§8) [open: until the static policy is validated] |
-| `O4L_SPACE_OVERHEAD`, `O4L_PARSE_OVERHEAD`, `O4L_COMPACT`, `O4L_DROP_TABLE` | tuning knobs; one computed policy instead |
-| `O4L_MIGRATE`, `O4L_MEMO_MIN` and the two-stage `MemoH` (small table that migrates to a flat memo) | one traversal memo, one rule |
-| `Expr.equal`'s budget and pair memo | to replace with a sharing-aware equality: memoize on node pairs from the start for terms above a size bound. Keep the semantics; remove the magic number 4096 [open: measure] |
-
-Kept:
-- `O4L_TIMES` and `--stats` (diagnostics);
-- `O4L_DEBUG`, renamed to `O4L_CHECK` (§10).
+`O4L_TIMES=1` prints the slowest blocks; `O4L_DEBUG=1` prints both sides when
+an exported inductive member differs from the derived one. Neither changes
+what is checked. There are no tuning variables.
 
 ## 10. Verification
 
@@ -289,7 +277,7 @@ Gates for every change, all of which must pass:
 2. **Acceptance:** all of Init, Std, the `Lean` package and the Mathlib proxy.
 3. **Determinism:** identical output with `-j 1` and `-j 4` on Init and Std
    (I4, I5).
-4. **Invariant mode:** `O4L_CHECK=1` on Init passes (I1–I3, I7).
+4. **Invariant mode** (I1–I3, I7): not implemented yet (§11).
 5. **Unit tests:** `tests/ztest.py` (bignum), level normalization, and the I7
    limits.
 
@@ -304,33 +292,13 @@ To add:
 - **Official-kernel differential:** `tools/Replay.lean` on every test, where
   the official kernel is available.
 
-## 11. Plan
+## 11. Not done yet
 
-Each phase ends with all gates passing (§10) and no new environment variables.
-
-1. **Strip.** Delete §9's items except the governor. Fix the suspected
-   slot-indexing flaw if it is confirmed. *Exit:* gates pass; line count and
-   knobs reduced; performance within 5% of today.
-2. **Make the invariants checkable.** Add `O4L_CHECK` and the determinism and
-   unit tests. *Exit:* gate 4 passes on Init and Std.
-3. **Static memory policy.** Replace the governor; validate on the Mathlib
-   proxy with the arena's memory-to-environment ratio. *Exit:* proxy peak
-   within budget at 4 domains, with no throttling code.
-4. **Exact-sharing traversals and equality.** Unify the traversal memos and
-   `Expr.equal` under one memo discipline (I3). *Exit:* no magic thresholds;
-   performance at least as today.
-5. **Mutation testing.** *Exit:* every mutation class has a rejection test.
-
-## 12. Open questions
-
-- Can the static memory policy fit Mathlib at 4 domains on 16 GB? It needs a
-  measurement on the proxy at the arena's ratio before the governor goes.
-- Should terms built during checking be hash-consed in the scratch tier, so
-  that equality is physical everywhere and I2 becomes trivial? This was
-  reverted in 66161eb for speed; under §2's priorities it may be worth a
-  modest slowdown. Decide by measurement against the 1.5× allowance.
-- Which arena perf tests, if any, rely on heuristics beyond Lean's order? None
-  is known; check during phase 4.
+- Debug-mode checks for I1–I3 and unit tests at the packing limits (I7).
+- Mutation testing against the official kernel (today the two checkers are
+  compared with each other).
+- `Expr.equal` starts memoising node pairs after 4096 comparisons; the bound
+  is a measured compromise, not derived.
 
 ## 13. Two checkers
 
@@ -339,7 +307,7 @@ plain terms, no hash-consing, exact memo tables only, no search heuristics beyon
 Lean's lazy-delta order, universe levels decided semantically, and no code shared
 with `src/`. It is slow (about 7x on Init and without sharing it cannot do the
 performance suites), so it is a test oracle, not a product. Any faster core
-(for example the closure-based evaluator of `docs/CLOSURE.md`) is accepted only
+is accepted only
 if it gives the reference's verdict on everything the reference can decide.
 
 Differences in verdict are recorded, not hidden: the reference accepts
