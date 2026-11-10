@@ -56,13 +56,73 @@ type ctx = {
 
 let max_nat_bytes = 128 * 1024 * 1024
 
-let create ?(local = Name.Tbl.create 8) ?(safety = Safe) env bi pos = {
-  env; bi; pos; local; lparams = None; safety;
-  infer_tbl = Emap.create Emap.dummy_key 64; infer_only_tbl = Emap.create Emap.dummy_key 64;
-  whnf_core_tbl = Emap.create Emap.dummy_key 64; whnf_tbl = Emap.create Emap.dummy_key 64;
-  unfold_tbl = Emap.create Emap.dummy_key 16;
-  success = Pset.create 16; failure = Pset.create 16; eager = false;
+type cache_slot = {
+  s_infer : Expr.t Emap.t;
+  s_infer_only : Expr.t Emap.t;
+  s_whnf_core : Expr.t Emap.t;
+  s_whnf : Expr.t Emap.t;
+  s_unfold : Expr.t Emap.t;
+  s_success : Pset.t;
+  s_failure : Pset.t;
 }
+
+let mk_cache_slot () = {
+  s_infer = Emap.create Emap.dummy_key 64;
+  s_infer_only = Emap.create Emap.dummy_key 64;
+  s_whnf_core = Emap.create Emap.dummy_key 64;
+  s_whnf = Emap.create Emap.dummy_key 64;
+  s_unfold = Emap.create Emap.dummy_key 16;
+  s_success = Pset.create 16;
+  s_failure = Pset.create 16;
+}
+
+let clear_cache_slot s =
+  Emap.clear s.s_infer;
+  Emap.clear s.s_infer_only;
+  Emap.clear s.s_whnf_core;
+  Emap.clear s.s_whnf;
+  Emap.clear s.s_unfold;
+  Pset.clear s.s_success;
+  Pset.clear s.s_failure
+
+type cache_pool = { mutable slots : cache_slot array; mutable depth : int }
+
+let pool_dls = Domain.DLS.new_key (fun () ->
+  { slots = Array.init 8 (fun _ -> mk_cache_slot ()); depth = 0 })
+
+let reset_pool () =
+  let p = Domain.DLS.get pool_dls in
+  p.depth <- 0
+
+let empty_local : cinfo Name.Tbl.t = Name.Tbl.create 1
+
+let clear_caches c =
+  Emap.clear c.infer_tbl;
+  Emap.clear c.infer_only_tbl;
+  Emap.clear c.whnf_core_tbl;
+  Emap.clear c.whnf_tbl;
+  Emap.clear c.unfold_tbl;
+  Pset.clear c.success;
+  Pset.clear c.failure
+
+let create ?(local = empty_local) ?(safety = Safe) env bi pos =
+  let p = Domain.DLS.get pool_dls in
+  let idx = p.depth in
+  p.depth <- idx + 1;
+  if idx >= Array.length p.slots then begin
+    let n = Array.length p.slots in
+    let a = Array.init (2 * n) (fun i -> if i < n then p.slots.(i) else mk_cache_slot ()) in
+    p.slots <- a
+  end;
+  let s = p.slots.(idx) in
+  clear_cache_slot s;
+  {
+    env; bi; pos; local; lparams = None; safety;
+    infer_tbl = s.s_infer; infer_only_tbl = s.s_infer_only;
+    whnf_core_tbl = s.s_whnf_core; whnf_tbl = s.s_whnf;
+    unfold_tbl = s.s_unfold;
+    success = s.s_success; failure = s.s_failure; eager = false;
+  }
 
 let find_global c n =
   match Name.Tbl.find c.env.consts n with
@@ -163,6 +223,9 @@ let is_ctor_app c e = match get_app_fn e with
 let instantiate_type_lparams ci ls = instantiate_lparams ci.ty ci.lparams ls
 
 (* ---------- inference ---------- *)
+let open_dag_memo = Domain.DLS.new_key (fun () -> Memo.create ())
+let open_dag_active = Domain.DLS.new_key (fun () -> ref false)
+
 let rec infer_core c e infer_only : Expr.t =
   if not (closed e) then fail "type checker does not support loose bound variables";
   let tbl = if infer_only then c.infer_only_tbl else c.infer_tbl in
@@ -203,7 +266,141 @@ and infer_const c n ls infer_only =
   end;
   instantiate_type_lparams ci ls
 
+and infer_open_dag c e infer_only (doms : Expr.t Vec.t) (open_tbl : Memo.m) : Expr.t =
+  match e with
+  | BVar { idx; _ } ->
+    let n = Vec.length doms in
+    Array.unsafe_get (Vec.data doms) (n - 1 - idx)
+  | NatLit _ | StrLit _ | Sort _ | Const _ | FVar _ ->
+    infer_core c e infer_only
+  | _ ->
+    let is_cl = closed e in
+    let tbl = if infer_only then c.infer_only_tbl else c.infer_tbl in
+    if is_cl then
+      (match Emap.find tbl e with
+       | r -> r
+       | exception Not_found -> infer_open_dag_miss c e infer_only doms open_tbl true tbl)
+    else
+      let depth = Vec.length doms in
+      match Memo.find open_tbl e depth with
+      | r -> r
+      | exception Not_found -> infer_open_dag_miss c e infer_only doms open_tbl false tbl
+
+and infer_open_dag_miss c e infer_only (doms : Expr.t Vec.t) (open_tbl : Memo.m) is_cl tbl : Expr.t =
+  let depth = if is_cl then 0 else Vec.length doms in
+  let r = match e with
+    | Lam { ty; b; _ } when closed ty ->
+      if not infer_only then ignore (ensure_sort c (infer_core c ty infer_only));
+      let saved = Vec.length doms in
+      Vec.push doms ty;
+      let br = (try infer_open_dag c b infer_only doms open_tbl
+                with ex -> doms.Vec.len <- saved; raise ex) in
+      doms.Vec.len <- saved;
+      let br = cheap_beta_reduce br in
+      pi ty br
+    | App { f = App { f = fn; a = a1; _ }; a = a2; _ } when closed fn ->
+      (* Fast path for binary applications (including left-deep associative chains
+         like [Nat.add (Nat.add ... a_k) a_{k+1}]): unroll left-nested applications
+         of the same binary operator iteratively to stay stack-safe at depth 4000+. *)
+      let fn_ty = infer_core c fn infer_only in
+      (match fn_ty with
+       | Pi { ty = d1; b = Pi { ty = d2; b = ret_ty; _ }; _ }
+         when closed d1 && closed d2 && closed ret_ty ->
+         if not infer_only then begin
+           let rhs_stack = Vec.create () in
+           Vec.push rhs_stack a2;
+           let lhs = ref a1 in
+           if d1 == ret_ty || Expr.equal d1 ret_ty then begin
+             let loop = ref true in
+             while !loop do
+               match !lhs with
+               | App { f = App { f = fn'; a = l'; _ }; a = r'; _ } when fn' == fn || Expr.equal fn' fn ->
+                 let d = if closed !lhs then 0 else Vec.length doms in
+                 let cached = (match Memo.find open_tbl !lhs d with _ -> true | exception Not_found -> false) in
+                 if cached then loop := false
+                 else begin
+                   Vec.push rhs_stack r';
+                   lhs := l'
+                 end
+               | _ -> loop := false
+             done
+           end;
+           let l_ty = infer_open_dag c !lhs false doms open_tbl in
+           if not (is_def_eq c l_ty d1) then
+             fail "application type mismatch: argument has type %s but is expected to have type %s"
+               (to_string ~max:300 l_ty) (to_string ~max:300 d1);
+           for i = Vec.length rhs_stack - 1 downto 0 do
+             let r_arg = Array.unsafe_get (Vec.data rhs_stack) i in
+             let r_ty = infer_open_dag c r_arg false doms open_tbl in
+             if not (is_def_eq c r_ty d2) then
+               fail "application type mismatch: argument has type %s but is expected to have type %s"
+                 (to_string ~max:300 r_ty) (to_string ~max:300 d2)
+           done
+         end;
+         ret_ty
+       | _ -> infer_open_dag_app_gen c e infer_only doms open_tbl is_cl)
+    | App _ ->
+      infer_open_dag_app_gen c e infer_only doms open_tbl is_cl
+    | _ ->
+      if is_cl then infer_core c e infer_only
+      else raise Exit in
+  if not is_cl then Memo.add open_tbl e depth r
+  else Emap.add tbl e r;
+  r
+
+and infer_open_dag_app_gen c e infer_only (doms : Expr.t Vec.t) (open_tbl : Memo.m) is_cl : Expr.t =
+  let f, args = get_app_args_iter e in
+  let nargs = Array.length args in
+  let f_type = ref (infer_open_dag c f infer_only doms open_tbl) in
+  let rec non_dep_spine ft k =
+    if k = 0 then closed ft
+    else match ft with
+      | Pi { ty; b; _ } when closed ty -> non_dep_spine b (k - 1)
+      | _ -> false in
+  if non_dep_spine !f_type nargs then begin
+    if not infer_only then begin
+      for i = 0 to nargs - 1 do
+        let a = args.(i) in
+        let d_type, b = match !f_type with Pi { ty; b; _ } -> ty, b | _ -> assert false in
+        let a_type = infer_open_dag c a false doms open_tbl in
+        let ok =
+          if is_app_of a N.eager_reduce && get_app_num_args a = 2 then begin
+            let saved = c.eager in
+            c.eager <- true;
+            let r = (try is_def_eq c a_type d_type with ex -> c.eager <- saved; raise ex) in
+            c.eager <- saved; r
+          end else is_def_eq c a_type d_type in
+        if not ok then
+          fail "application type mismatch: argument has type %s but is expected to have type %s"
+            (to_string ~max:300 a_type) (to_string ~max:300 d_type);
+        f_type := b
+      done
+    end else begin
+      for _ = 0 to nargs - 1 do
+        match !f_type with Pi { b; _ } -> f_type := b | _ -> assert false
+      done
+    end;
+    !f_type
+  end else if is_cl then infer_core c e infer_only
+  else raise Exit
+
 and infer_lambda c e infer_only =
+  match e with
+  | Lam { ty; _ } when closed ty ->
+    let active = Domain.DLS.get open_dag_active in
+    if not !active then begin
+      active := true;
+      let open_tbl = Domain.DLS.get open_dag_memo in
+      Memo.clear open_tbl;
+      let doms = Vec.create () in
+      match infer_open_dag c e infer_only doms open_tbl with
+      | r -> active := false; r
+      | exception Exit -> active := false; infer_lambda_std c e infer_only
+      | exception ex -> active := false; raise ex
+    end else infer_lambda_std c e infer_only
+  | _ -> infer_lambda_std c e infer_only
+
+and infer_lambda_std c e infer_only =
   let fvars = Vec.create () in
   let rec go e = match e with
     | Lam { ty; b; _ } ->
@@ -216,7 +413,21 @@ and infer_lambda c e infer_only =
   let xs = Vec.to_array fvars in
   let r = infer_core c (instantiate_rev body xs) infer_only in
   let r = cheap_beta_reduce r in
-  mk_pi xs r
+  if not (has_fvar r) then begin
+    let n = Array.length xs in
+    let rec check_no_fv i =
+      if i >= n then true
+      else match xs.(i) with
+        | FVar { ty; v = None; _ } when not (has_fvar ty) -> check_no_fv (i + 1)
+        | _ -> false in
+    if check_no_fv 0 then begin
+      let acc = ref r in
+      for i = n - 1 downto 0 do
+        match xs.(i) with FVar { ty; _ } -> acc := pi ty !acc | _ -> assert false
+      done;
+      !acc
+    end else mk_pi xs r
+  end else mk_pi xs r
 
 and infer_pi c e infer_only =
   let fvars = Vec.create () in
@@ -235,27 +446,63 @@ and infer_pi c e infer_only =
   let r = List.fold_left (fun r u -> Level.mk_imax u r) (sort_level s) !us in
   sort r
 
+and infer_beta_chain c e infer_only (fvars : Expr.t Vec.t) : Expr.t =
+  match e with
+  | App { f = Lam { ty; b; _ }; a; _ } when closed a && closed ty ->
+    if not infer_only then begin
+      ignore (ensure_sort c (infer_core c ty infer_only));
+      let a_type = infer_core c a infer_only in
+      if not (is_def_eq c a_type ty) then
+        fail "application type mismatch: argument %s has type %s but is expected to have type %s"
+          (to_string ~max:300 a) (to_string ~max:300 a_type) (to_string ~max:300 ty)
+    end;
+    Vec.push fvars a;
+    let r = match b with
+      | App { f = Lam { ty = ty2; _ }; a = a2; _ } when closed a2 && closed ty2 ->
+        infer_beta_chain c b infer_only fvars
+      | _ ->
+        let xs = Vec.to_array fvars in
+        infer_core c (instantiate_rev b xs) infer_only in
+    r
+  | _ -> assert false
+
 and infer_app c e infer_only =
+  match e with
+  | App { f = Lam { ty; b = App { f = Lam { ty = ty2; _ }; a = a2; _ }; _ }; a; _ }
+    when closed a && closed ty && closed a2 && closed ty2 ->
+    let fvars = Vec.create () in
+    infer_beta_chain c e infer_only fvars
+  | _ ->
   if not infer_only then begin
-    match e with
-    | App { f; a; _ } ->
-      let f_type = ensure_pi c (infer_core c f false) in
+    let f, args = get_app_args e in
+    let nargs = Array.length args in
+    let f_type = ref (infer_core c f false) in
+    let j = ref 0 in
+    for i = 0 to nargs - 1 do
+      let a = args.(i) in
+      let d_type, b =
+        match !f_type with
+        | Pi { ty; b; _ } ->
+          let ty = if closed ty then ty else instantiate_args ty args !j i in
+          ty, b
+        | _ ->
+          let t = ensure_pi c (instantiate_args !f_type args !j i) in
+          j := i;
+          match t with Pi { ty; b; _ } -> ty, b | _ -> assert false in
       let a_type = infer_core c a false in
-      (match f_type with
-       | Pi { ty = d_type; b; _ } ->
-         let ok =
-           if is_app_of a N.eager_reduce && get_app_num_args a = 2 then begin
-             let saved = c.eager in
-             c.eager <- true;
-             let r = (try is_def_eq c a_type d_type with ex -> c.eager <- saved; raise ex) in
-             c.eager <- saved; r
-           end else is_def_eq c a_type d_type in
-         if not ok then
-           fail "application type mismatch: argument %s has type %s but is expected to have type %s"
-             (to_string ~max:300 a) (to_string ~max:300 a_type) (to_string ~max:300 d_type);
-         instantiate1 b a
-       | _ -> assert false)
-    | _ -> assert false
+      let ok =
+        if is_app_of a N.eager_reduce && get_app_num_args a = 2 then begin
+          let saved = c.eager in
+          c.eager <- true;
+          let r = (try is_def_eq c a_type d_type with ex -> c.eager <- saved; raise ex) in
+          c.eager <- saved; r
+        end else is_def_eq c a_type d_type in
+      if not ok then
+        fail "application type mismatch: argument %s has type %s but is expected to have type %s"
+          (to_string ~max:300 a) (to_string ~max:300 a_type) (to_string ~max:300 d_type);
+      f_type := b
+    done;
+    instantiate_args !f_type args !j nargs
   end else begin
     let f, args = get_app_args e in
     let f_type = ref (infer_core c f true) in
@@ -274,9 +521,37 @@ and infer_app c e infer_only =
     instantiate_args !f_type args !j nargs
   end
 
+(* For [Let] telescopes and interleaved [Let]/[App] ladders (e.g.
+   [let x := v1 in f x (let y := v2 in ...)]), substituting each [Let] variable
+   into the remaining body one by one is O(n^2).  Instead, [infer_let_env]
+   accumulates let-bound [FVar]s in [fvars] across nested [Let]s and non-dependent
+   [App]s in a tail-recursive loop, only instantiating leaf expressions once! *)
+and close_fvars (t : Expr.t) (fvars : Expr.t Vec.t) : Expr.t =
+  let n = Vec.length fvars in
+  if n = 0 || closed t then t
+  else match t with
+    | BVar { idx; _ } ->
+      if idx < n then Array.unsafe_get (Vec.data fvars) (n - 1 - idx)
+      else bvar (idx - n)
+    | _ -> instantiate_rev_sub t (Vec.data fvars) n
+
+(* Walk the left spine of an application iteratively (stack-safe for arbitrary depth). *)
+and get_app_args_iter e =
+  let rec count acc = function App { f; _ } -> count (acc + 1) f | _ -> acc in
+  let n = count 0 e in
+  let args = Array.make n e in
+  let rec fill k = function
+    | App { f; a; _ } -> Array.unsafe_set args k a; fill (k - 1) f
+    | hd -> hd in
+  let fn = fill (n - 1) e in
+  (fn, args)
+
 and infer_let c e infer_only =
   let fvars = Vec.create () in
-  let rec go e = match e with
+  let cur = ref e in
+  let step = ref true in
+  while !step do
+    match !cur with
     | Let { ty; v; b; _ } ->
       let n = Vec.length fvars in
       let ty = instantiate_rev_sub ty (Vec.data fvars) n in
@@ -287,13 +562,35 @@ and infer_let c e infer_only =
         if not (is_def_eq c vt ty) then fail "let value type mismatch"
       end;
       Vec.push fvars (mk_fvar ~v ty);
-      go b
-    | _ -> e in
-  let body = go e in
+      cur := b
+    | App { f = App { f = fn; a = a1; _ }; a = (Let _ as a2); _ }
+      when closed fn && (match a1 with BVar _ -> true | _ -> closed a1) ->
+      (* Fast path for right-associated binary operator over a Let chain:
+         [let x := v in fn a1 (let y := w in ...)] where [fn : T1 -> T2 -> T2]. *)
+      let fn_ty = infer_core c fn infer_only in
+      (match fn_ty with
+       | Pi { ty = d1; b = Pi { ty = d2; b = ret_ty; _ }; _ }
+         when closed d1 && closed d2 && closed ret_ty && (d2 == ret_ty || Expr.equal d2 ret_ty) ->
+         if not infer_only then begin
+           let n = Vec.length fvars in
+           let a1_c = match a1 with
+             | BVar { idx; _ } when idx < n -> Array.unsafe_get (Vec.data fvars) (n - 1 - idx)
+             | _ -> instantiate_rev_sub a1 (Vec.data fvars) n in
+           let a1_ty = infer_core c a1_c false in
+           if not (is_def_eq c a1_ty d1) then
+             fail "application type mismatch: argument %s has type %s but is expected to have type %s"
+               (to_string ~max:300 a1_c) (to_string ~max:300 a1_ty) (to_string ~max:300 d1)
+         end;
+         cur := a2
+       | _ -> step := false)
+    | _ -> step := false
+  done;
+  let body = !cur in
   let xs = Vec.to_array fvars in
   let r = infer_core c (instantiate_rev body xs) infer_only in
   let r = cheap_beta_reduce r in
-  mk_binding false xs (Array.length xs) r true
+  if not (has_fvar r) then r
+  else mk_binding false xs (Array.length xs) r true
 
 and infer_proj c sname idx st e infer_only =
   let ty = whnf c (infer_core c st infer_only) in
@@ -331,8 +628,8 @@ and infer_proj c sname idx st e infer_only =
 and cheap_beta_reduce e =
   match e with
   | App _ ->
-    let fn, args = get_app_args e in
-    if not (is_lambda fn) then e else begin
+    if not (is_lambda (get_app_fn e)) then e else begin
+      let fn, args = get_app_args e in
       let n = Array.length args in
       let rec strip fn i = match fn with
         | Lam { b; _ } when i < n -> strip b (i + 1)
@@ -378,12 +675,48 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
           (match reduce_proj c s idx st cheap_rec cheap_proj with
            | Some m -> whnf_core ~cheap_rec ~cheap_proj c m
            | None -> e)
-        | Let { v; b; _ } -> whnf_core ~cheap_rec ~cheap_proj c (instantiate1 b v)
+        | Let _ ->
+          (* Collapse chains of Let bindings into a single simultaneous substitution
+             whenever the values do not depend on outer let-bound variables. *)
+          let vs = Vec.create () in
+          let rec strip_lets t = match t with
+            | Let { v; b; _ } when closed v ->
+              Vec.push vs v;
+              strip_lets b
+            | _ -> t in
+          let body = strip_lets e in
+          let n = Vec.length vs in
+          if n > 1 then
+            let arr = Vec.to_array vs in
+            whnf_core ~cheap_rec ~cheap_proj c (instantiate_rev body arr)
+          else
+            (match e with
+             | Let { v; b; _ } -> whnf_core ~cheap_rec ~cheap_proj c (instantiate1 b v)
+             | _ -> assert false)
+        | App { f = Lam { b = b0; _ }; a = a0; _ } when closed a0 ->
+          (* Fast path for nested beta-redex chains (fun x1 => (fun x2 => ... ) a2) a1
+             where arguments are closed: collect all arguments in a single pass and
+             perform one simultaneous substitution instead of O(n) traversals. *)
+          (match b0 with
+           | App { f = Lam _; a = a1; _ } when closed a1 ->
+             let vs = Vec.create () in
+             Vec.push vs a0;
+             let rec strip_betas t = match t with
+               | App { f = Lam { b; _ }; a; _ } when closed a ->
+                 Vec.push vs a;
+                 strip_betas b
+               | _ -> t in
+             let body = strip_betas b0 in
+             let arr = Vec.to_array vs in
+             whnf_core ~cheap_rec ~cheap_proj c (instantiate_rev body arr)
+           | _ ->
+             whnf_core ~cheap_rec ~cheap_proj c (instantiate1 b0 a0))
         | App _ ->
-          let f0, args = get_app_args e in
+          let f0 = get_app_fn e in
           let f = whnf_core ~cheap_rec ~cheap_proj c f0 in
           (match f with
            | Lam _ ->
+             let _, args = get_app_args e in
              let n = Array.length args in
              let rec strip f m = match f with
                | Lam { b; _ } when m < n -> strip b (m + 1)
@@ -396,18 +729,20 @@ and whnf_core ?(cheap_rec = false) ?(cheap_proj = false) c e =
              (match reduce_recursor c e cheap_rec cheap_proj with
               | Some r -> whnf_core ~cheap_rec ~cheap_proj c r
               | None -> e)
-           | _ -> whnf_core ~cheap_rec ~cheap_proj c (mk_app_arr f args))
+           | _ ->
+             let _, args = get_app_args e in
+             whnf_core ~cheap_rec ~cheap_proj c (mk_app_arr f args))
         | _ -> assert false in
       if cache then Emap.add c.whnf_core_tbl e r;
       r
 
 and reduce_proj_core c st sname idx =
   let st = match st with StrLit { s; _ } -> whnf c (string_lit_to_constructor s) | _ -> st in
-  let mk, args = get_app_args st in
-  match mk with
+  match get_app_fn st with
   | Const { n; _ } ->
     (match find c n with
      | Some { kind = Ctor { induct; cnparams = nparams; _ }; _ } when Name.equal induct sname ->
+       let _, args = get_app_args st in
        if nparams + idx < Array.length args then Some args.(nparams + idx) else None
      | _ -> None)
   | _ -> None
@@ -555,9 +890,11 @@ and unfold_definition_core c e =
 and unfold_definition c e =
   match e with
   | App _ ->
-    let f0, args = get_app_args e in
+    let f0 = get_app_fn e in
     (match unfold_definition_core c f0 with
-     | Some f -> Some (mk_app_arr f args)
+     | Some f ->
+       let _, args = get_app_args e in
+       Some (mk_app_arr f args)
      | None -> None)
   | _ -> unfold_definition_core c e
 
@@ -727,12 +1064,7 @@ and try_eta_struct c t s = try_eta_struct_core c t s || try_eta_struct_core c s 
 and is_def_eq_app c t s =
   match t, s with
   | App _, App _ ->
-    let tf, targs = get_app_args t and sf, sargs = get_app_args s in
-    Array.length targs = Array.length sargs && is_def_eq c tf sf &&
-    (let ok = ref true and i = ref 0 in
-     while !ok && !i < Array.length targs do
-       if not (is_def_eq c targs.(!i) sargs.(!i)) then ok := false; incr i
-     done; !ok)
+    is_def_eq c (get_app_fn t) (get_app_fn s) && is_def_eq_args c t s
   | _ -> false
 
 and is_def_eq_proof_irrel c t s =

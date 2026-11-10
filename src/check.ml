@@ -239,7 +239,7 @@ let builtins (env : Env.t) =
 type result = { errors : (int * string) list; checked : int; internal_only : bool }
 (* [internal_only]: every failure was an internal error (no kernel verdict) *)
 
-let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.reset_local ()
+let reset_scratch () = Name.H.reset_local (); Level.H.reset_local (); Expr.H.reset_local (); Tc.reset_pool ()
 
 (* ------------------------------------------------------------ governor *)
 (* Memory governor.  Peak memory depends on the input's shape (how large the
