@@ -198,15 +198,13 @@ let line st (s : string) =
   | _ -> bad "line is not an object"
 
 (* fast path for name / level / expression lines *)
-let fast_line st (buf : bytes) off len : bool =
+let fast_line st (l : string) : bool =
   let f = st.fl in
-  Fastline.scan_bytes f buf off len && begin
+  Fastline.scan f l && begin
     let open Fastline in
-    let iv k = Array.unsafe_get f.ints k in
-    let has k = Array.unsafe_get f.ints k <> min_int in
-    let sv k =
-      let sl = Array.unsafe_get f.slen k in
-      if sl < 0 then raise Exit else Bytes.sub_string buf (Array.unsafe_get f.sstart k) sl in
+    let iv k = f.ints.(k) in
+    let has k = f.ints.(k) <> min_int in
+    let sv k = if f.slen.(k) < 0 then raise Exit else String.sub l f.sstart.(k) f.slen.(k) in
     let nm k = get st.names (iv k) "name" and lv k = get st.levels (iv k) "level" and ex k = get st.exprs (iv k) "expr" in
     try
       if has k_ie then begin
@@ -217,18 +215,16 @@ let fast_line st (buf : bytes) off len : bool =
           else if f.kind = k_app then Expr.app (ex k_fn) (ex k_arg)
           else if f.kind = k_const then begin
             if f.arr_key <> k_us then raise Exit;
-            let rec mk_ls j acc =
-              if j < 0 then acc
-              else mk_ls (j - 1) (get st.levels (Array.unsafe_get f.arr j) "level" :: acc) in
-            Expr.const (nm k_name) (mk_ls (f.arr_n - 1) [])
+            let ls = List.init f.arr_n (fun j -> get st.levels f.arr.(j) "level") in
+            Expr.const (nm k_name) ls
           end
           else if f.kind = k_forall then Expr.pi (ex k_type) (ex k_body)
           else if f.kind = k_lam then Expr.lam (ex k_type) (ex k_body)
           else if f.kind = k_let then Expr.let_ (ex k_type) (ex k_value) (ex k_body)
           else if f.kind = k_proj then
             (if iv k_idx < 0 then raise Exit; Expr.proj (nm k_typename) (iv k_idx) (ex k_struct))
-          else if Array.unsafe_get f.slen k_strval >= 0 then raise Exit   (* may contain escapes: generic path *)
-          else if Array.unsafe_get f.slen k_natval >= 0 then Expr.natlit (Z.of_string (sv k_natval))
+          else if f.slen.(k_strval) >= 0 then raise Exit   (* may contain escapes: generic path *)
+          else if f.slen.(k_natval) >= 0 then Expr.natlit (Z.of_string (sv k_natval))
           else raise Exit in
         def_unique st.exprs i e "expr"; true
       end else if has k_in then begin
@@ -266,42 +262,16 @@ let read_channel ?(size_hint = 0) ic : Env.t =
   Idx.set st.names 0 Name.Anon;
   Idx.set st.levels 0 Level.zero;
   let lineno = ref 0 in
-  let handle_line buf off len =
-    incr lineno;
-    let len = if len > 0 && Bytes.unsafe_get buf (off + len - 1) = '\r' then len - 1 else len in
-    if len > 0 then
-      (try if not (fast_line st buf off len) then line st (Bytes.sub_string buf off len) with
-       | J.Error m -> bad "line %d: json error: %s" !lineno m
-       | Bad m -> bad "line %d: %s" !lineno m
-       | Failure m | Invalid_argument m -> bad "line %d: %s" !lineno m) in
-  let buf = ref (Bytes.create (1 lsl 20)) in
-  let pos = ref 0 and fill = ref 0 and eof = ref false in
-  while not !eof || !pos < !fill do
-    let b = !buf in
-    let nl = ref !pos in
-    while !nl < !fill && Bytes.unsafe_get b !nl <> '\n' do incr nl done;
-    if !nl < !fill then begin
-      let start = !pos and len = !nl - !pos in
-      pos := !nl + 1;
-      handle_line b start len
-    end else if !eof then begin
-      let start = !pos and len = !fill - !pos in
-      pos := !fill;
-      handle_line b start len
-    end else begin
-      let rem = !fill - !pos in
-      if rem > 0 && !pos > 0 then Bytes.blit b !pos b 0 rem;
-      pos := 0; fill := rem;
-      if !fill = Bytes.length b then begin
-        let nb = Bytes.create (2 * Bytes.length b) in
-        Bytes.blit b 0 nb 0 !fill;
-        buf := nb
-      end;
-      let b = !buf in
-      let n = input ic b !fill (Bytes.length b - !fill) in
-      if n = 0 then eof := true else fill := !fill + n
-    end
-  done;
+  (try
+     while true do
+       let l = input_line ic in
+       incr lineno;
+       if String.length l > 0 then
+         (try if not (fast_line st l) then line st l with
+          | J.Error m -> bad "line %d: json error: %s" !lineno m
+          | Bad m -> bad "line %d: %s" !lineno m
+          | Failure m | Invalid_argument m -> bad "line %d: %s" !lineno m)
+     done
+   with End_of_file -> ());
   flush_quot st;
   { consts = st.consts; blocks = Array.of_list (List.rev st.blocks); dups = st.dups }
-
