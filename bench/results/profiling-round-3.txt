@@ -1,0 +1,32 @@
+# Profiling-driven round. Check time (s) from --stats, timings never taken under a profiler.
+# bench/quick.sh, baseline = e2fb600 (o4l_r3base), final = this commit (o4l_r3f)
+init -j1                   check=  49.074s  rss=  1311MB  ->  34.852s  rss= 1318MB
+init -j4                   check=  13.919s  rss=  1346MB  ->  10.440s  rss= 1353MB
+std -j4                    check=  23.965s  rss=  1919MB  ->  18.622s  rss= 1916MB
+lean -j4                   check=  29.181s  rss=  2899MB  ->  21.773s  rss= 2874MB
+perf/magma_list_pair_n7    check=   3.065s  rss=   487MB  ->   2.507s  rss=  502MB
+perf/grind_ring_5          check=   1.983s  rss=   202MB  ->   1.509s  rss=  201MB
+perf/app_lam               check=   8.576s  rss=  1248MB  ->   7.736s  rss= 1246MB
+perf/beta_ladder           check=   2.170s  rss=   386MB  ->   1.662s  rss=  385MB
+
+# Steps (Init -j1 check s, interleaved runs; app_lam / beta_ladder where relevant)
+a  int min/max in Expr.union         base 48.58 48.41      -> 45.41 44.81                 kept
+b  small memo, 2 interleaved arrays   r3a 44.94 47.02       -> 48.83 52.01 (arrays > 256 words: major heap)  dropped
+c  small memo, 4 arrays <= 256 words  r3a 47.26 45.57       -> 44.82 46.52 ; app_lam 8.55/9.07 -> 7.87/7.81 ; beta 2.08/2.16 -> 1.66/1.65  kept
+d  memo_min 0 -> 8                    44.94 45.57 44.34     -> 40.62 40.62 40.40           kept (16, 32 within noise of 8)
+-  literal arrays (get_app_args, memo) r3d 40.96 40.22 40.76 -> 39.98 40.35 40.91          dropped
+f  batched check-mode infer_app       r3d 39.60 40.71 41.13 -> 36.54 36.98 36.22           kept
+
+# Rejected without code change
+O4L_SPACE_OVERHEAD 120/200/400: check 46.1/45.0/44.3 s, RSS 1.36/2.07/3.16 GB
+minor heap s=256k/1M/4M/16M: check 41.3/42.1/42.2/44.7 s, promoted 490/459/448/446 MW
+global hash-cons lookups while checking: 48.7 M lookups, 73% hit -> kept as is
+
+# Counters (temporary sites, Init -j1): instantiate 10.9 M calls / 199 M nodes; small-memo resizes 15.7 M;
+# get_app_args 32.9 M calls, 3.7 args on average; Emap.create 341 k; Pset.create 136 k.
+# O4L_MEMPROF=1e-4 (Init -j1): 562 k sampled allocations, 46 k promoted, ~95% of them expression nodes
+# built by instantiate/instantiate1 (results kept in caches); cache tables ~3%.
+# Mathlib proxy, -j4 (bench/memprofile.sh): parse 103.7 s, check 180.4 s, total 284.0 s, peak RSS 8846 MB,
+# top_heap 6848 MB, 1,056,596 accepted. (Previous measurement, session build without parser change:
+# 436 s, peak 8163 MB, top_heap 6712 MB.)
+# Validation: bench/arena.py 95 cases, 0 wrong, agrees with official on 69/69; arena_ndjson 24/24; lean_tests 1/1.

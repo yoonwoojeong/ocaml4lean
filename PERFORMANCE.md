@@ -86,6 +86,211 @@ The first arena run (2026-11-08) found two problems, both fixed since:
   hash-cons table after parsing would save little more and costs ~45% check
   time, so it is not done.
 
+## Second optimization round: techniques from other kernels
+
+Other arena kernels, chiefly [sokonanoda](https://github.com/intgrah/sokonanoda) and
+[pestka](https://github.com/jasisz/pestka), were read for techniques that suit this design. Four were ported, one at a time, each measured
+against `main` (8715624) on OCaml 5.4.0. Raw data: `bench/results/optimization-round-2.txt`;
+`bench/quick.sh BINARY` reruns the main measurements.
+
+| workload | before: parse + check | after: parse + check | check time |
+|---|---:|---:|---:|
+| Init, 1 domain | 7.8 + 76.4 s | 5.9 + 48.7 s | −36% |
+| Init, 4 domains | 7.3 + 20.2 s | 6.1 + 15.8 s | −22% |
+| Std, 4 domains | 12.2 + 49.0 s | 10.1 + 26.1 s | −47% |
+| Lean, 4 domains | 16.1 + 56.0 s | 12.4 + 29.9 s | −47% |
+| Mathlib proxy (6.2 GB), 4 domains | 585 s total | 436 s total | −36% total |
+
+Peak RSS is unchanged within 3% (proxy 8.06 → 8.16 GB). The adversarial perf
+cases (`app-lam`, `beta-ladder`, `magma`) are unchanged within run-to-run noise: they
+are single large declarations, which session caches cannot help.
+
+1. **Session caches** (sokonanoda's `TcCache` sessions, Pestka's session reuse). A
+   domain keeps its caches across declarations instead of discarding them after each
+   one. It keeps infer-only types, weak head normal forms, unfoldings, and def-eq
+   successes and failures. The session is reset after an entry budget is exceeded
+   (`O4L_SESSION`, 10⁶ entries; `0` disables it).
+   *Soundness:*
+   * Only results that do not depend on the declaration are kept. These are facts
+     about closed terms and the constants they mention. Constants never change, and a
+     domain visits blocks in increasing order, so a later declaration sees a superset
+     of the constants. Failure records only gate a shortcut.
+   * Checking-mode inference depends on the declaration's universe parameters and
+     safety, so it is never shared.
+   * Contexts that change what names mean (inductive blocks, unsafe or partial
+     definitions that see themselves) never use a session.
+
+   *Performance:* only hash-consed environment terms are session keys. Their
+   equality is pointer equality. A first version keyed the session on all terms; it
+   compared rebuilt copies of large terms structurally and took Init from 77 s to
+   over 18 minutes.
+2. **Chunked scheduling** (sokonanoda's `CHUNK_SIZE = 64`). Domains claim 64
+   consecutive blocks at a time (`O4L_CHUNK`), so related declarations land in the
+   same session. Alone this is neutral; it is what makes sessions pay off with 4
+   domains.
+3. **Pair-hash fix** (found while profiling 1). `Hc.mix h x` depends only on `h lxor x`,
+   and the def-eq pair caches hashed a pair as `mix ha hb`. So every two pairs with
+   the same XOR of hashes collided, which is common for terms that differ in one
+   argument, and probing scanned long clusters. Mixing in two order-dependent steps
+   took Init (1 domain, with sessions) from 161 s to 50 s.
+4. **Parser** (sokonanoda's block reader and fixed-shape scanner). The input is read in
+   1 MB chunks and lines are scanned in place, with no string per line and no channel
+   lock per line. The newline is found by the scanner itself, so bytes are read once.
+   Keys are looked up in a table indexed by length and first and last character, and
+   only the slots a line set are reset. Parsing the 827 MB `Lean` export went from
+   16.1 s to 12.4 s. Lines the fast path does not take still go to the generic JSON
+   parser, as before. Most of the remaining parse time is hash-consing: lookups into
+   the 134 M-slot environment table miss the cache.
+
+Considered and not ported: skipping comparison of proof arguments (Pestka). It is
+justified by proof irrelevance, but deciding that an argument is a proof needs type
+inference, so the saving is small, and it changes which def-eq checks are made.
+
+## Experiments: kernel counters and olean-export
+
+Raw data: `bench/results/experiments-counters-olean-export.txt`.
+
+### Performance counters (kept)
+
+`src/ctr.ml` counts kernel events: inference, whnf, whnf_core and session lookups with
+their cache hits, def-eq calls (and how many end in the quick check or reach lazy
+delta), delta steps, unfoldings that instantiate universe parameters, and
+substitutions with the nodes they visit.
+
+* **Off by default, compiled out.** `enabled` is a compile-time constant. Only
+  `O4L_COUNTERS=1 ./build.sh` sets it, and then the totals are printed to stderr after
+  checking. In the default build the compiler removes every counter site: the
+  disassembly has no reference to the module outside its own code.
+* **Never affects a result.** Counters are only written, and are read once at exit.
+  Each domain has its own padded row of one array, so increments need no atomics.
+* **Overhead.** The default build matches the build before counters (Init on 1
+  domain: 49.0–49.5 s against 51.9–52.9 s, which is run-to-run and code-layout
+  variation). Enabled, counters cost about 1–2% (Init 49.6–50.2 s, Std on 4 domains
+  25.1–25.9 s against 24.6–25.3 s).
+
+What they already showed:
+* With session caches, 98% of session lookups hit (Init: 7.33 M of 7.45 M).
+  Unfoldings that instantiate universe parameters drop 4.7× (470 k → 101 k), and
+  whnf_core calls drop 17%.
+* 88% of def-eq calls end in the quick check.
+* `app-lam` makes only 4,179 substitutions, but they visit 80 M nodes (about 19 k
+  each), and `beta-ladder` visits 24 M. Their cost is the size of each substitution
+  (Θ(n²)), not caching. A fix would have to change how substitution works, for example
+  substitution in an environment instead of eager instantiation.
+
+### olean-export instead of `tools/Export.lean` (recommended for producing inputs)
+
+[olean-export](https://github.com/sdiehl/olean-export) 0.5.0 reads `.olean` files
+directly (Lean 4.26–4.35) and writes the same lean4export NDJSON format. It built with
+`cargo build --release`, and the checker reads its output unchanged: no integration
+work.
+
+| module | `Export.lean` | olean-export | declarations |
+|---|---:|---:|---:|
+| Init | 39.4 s, 2.41 GB | **2.8 s, 0.29 GB** | 65,893 / 59,349 |
+| Std | 64.2 s, 2.78 GB | **4.7 s, 0.45 GB** | 112,719 / 99,619 |
+| Lean | 95.3 s, 4.51 GB | **6.2 s, 0.66 GB** | 207,422 / 171,705 |
+
+* **Same declarations.** `olean-export compare` finds no differing declaration and none
+  that olean-export has and we lack. The only field-level difference is the `letE`
+  `nondep` flag, which olean-export always writes as `false` and the kernel ignores.
+* **Fewer declarations.** olean-export leaves out internal declarations (any name
+  component starting with `_`) that no public declaration uses, and drops `partial`
+  definitions (522 in Init). An export from it therefore checks 83–90% of what
+  `Export.lean` checks, and the official replay (`tools/Replay.lean`) would no longer
+  see the same set. `bench/run.sh` keeps `Export.lean` for that reason.
+* **Accepted in full.** ocaml4lean accepts its Init, Std and Lean exports. Check time is
+  the same as on our exports (Lean: 29.1 s against 29.3 s on 4 domains), since the
+  omitted declarations are cheap. Parsing is 6–7% faster, because the file is smaller.
+* **Benefit.** It is 13–15× faster at exporting, with 6–8× less memory, which makes
+  new workloads (Mathlib-sized ones included) practical to produce.
+* **No change to checking.** Its binary `blean` format (Lean: 233 MB against 744 MB of
+  NDJSON) would at most remove the text-scanning share of parsing, about a third of
+  11 s. The arena feeds checkers NDJSON, and blean's precomputed hashes and
+  loose-bound-variable ranges could not be trusted anyway. A blean reader is not worth
+  its code.
+
+## Third round: profiling-driven
+
+This round started from measurements of the current code rather than from other
+kernels. Baseline e2fb600, OCaml 5.4.0, raw data in
+`bench/results/profiling-round-3.txt`.
+
+| workload | before: check | after: check | peak RSS |
+|---|---:|---:|---:|
+| Init, 1 domain | 49.1 s | **34.9 s** (−29%) | 1.31 → 1.32 GB |
+| Init, 4 domains | 13.9 s | **10.4 s** (−25%) | 1.35 → 1.35 GB |
+| Std, 4 domains | 24.0 s | **18.6 s** (−22%) | 1.92 → 1.92 GB |
+| Lean, 4 domains | 29.2 s | **21.8 s** (−25%) | 2.90 → 2.87 GB |
+| perf: magma-n7, grind-ring-5, app-lam, beta-ladder | 3.07, 1.98, 8.58, 2.17 s | 2.51, 1.51, 7.74, 1.66 s | same |
+| Mathlib proxy (6.2 GB), 4 domains | 436 s total¹ | **284 s** total (parse 104 s + check 180 s) | 8.16 → 8.85 GB |
+
+¹ The last proxy measurement, made with round 2's session caches but without its
+parser change. The proxy's peak RSS rose 8%, while the GC's own top heap rose only 2%
+(6.71 → 6.85 GB). The peak is still below the governor's budget (9.65 GB here), and
+all 1,056,596 declarations are accepted.
+
+**Tools.** Each investigation used the cheapest tool that answers its question.
+Timings were always taken in separate runs, without a profiler.
+* **`perf record -F 499`, flat.** Shows where the time goes, at negligible overhead.
+  A `-g` build only adds debug info, which turns the numbered OCaml symbols (`go_1943`)
+  into source lines.
+* **`perf record --call-graph dwarf` at 97 Hz, with `bench/perfcallers.py`.** The script
+  groups samples by hot function and its nearest callers, skipping runtime trampolines
+  and recursion. It shows who calls `Hashtbl`, `compare_val` or the substitution
+  traversals.
+* **`O4L_COUNTERS=1`.** Counts how often something happens: substitutions and nodes, and,
+  as temporary sites never committed, array allocations and hash-cons lookups.
+* **`O4L_MEMPROF=RATE` (new, in `bin/main.ml`).** `Gc.Memprof` samples allocations during
+  checking and reports, by call site, those that were promoted to the major heap. It
+  costs one getenv when unset; at `1e-4` the run is about 14% slower, which is why it
+  is used only to read the report, never for timing.
+* **The VM has no hardware counters.** So A/B comparisons were interleaved runs of
+  both binaries, three where the difference was small.
+
+**Changes kept** (Init on 1 domain, check time, interleaved runs):
+1. **Int-specialised `min`/`max` in the node-info combiner** (48.5 → 45.1 s). `perf`
+   showed `compare_val` reached through `caml_lessequal`/`caml_greaterequal`. Without
+   flambda, `Stdlib.min`/`max` are polymorphic, so every node built during checking
+   called the C comparison twice.
+2. **Substitution memo without `Hashtbl`** (Init neutral; app-lam −10%, beta-ladder
+   −22%). The small per-traversal table was a `Hashtbl.Make` keyed by a
+   `(node, offset)` tuple: 8% of time in `seeded_hash`, `key_index`, `find`, closure
+   calls and resizing. It is now open addressing over four fresh arrays, compared by
+   identity, allocated on the first insert. A first version that packed pairs into two
+   arrays was 9% *slower* on Init: its arrays passed 256 words, and arrays that large
+   are allocated directly in the major heap, so the table moved out of the minor heap.
+   The arrays now stay at or below that size.
+3. **Memoise only subterms of tree size ≥ 8** (−9%, 44.9 → 40.5 s). Every node of every
+   substitution had paid a probe and an insert. A subterm smaller than the threshold is
+   rebuilt in at most 8 steps per occurrence, so DAG sharing cannot blow up. Thresholds
+   16 and 32 are within noise of 8.
+4. **Batched application checking** (−10%, 40.5 → 36.6 s). Profiling with callers
+   showed `instantiate1` called from `infer_app`. In checking mode each application
+   node instantiated the whole remaining Pi telescope with its argument, so a spine of
+   n arguments traversed the function type n times. The spine is now checked at once:
+   each argument's type is compared with the domain instantiated with the earlier
+   arguments, and the body is instantiated once at the end. This is how the infer-only
+   path already worked. Substitution commutes with Pi, so every def-eq check sees the
+   same terms as before.
+
+**Measured and dropped:**
+* **Array literals instead of `Array.make`.** Counters showed `get_app_args` called
+  33 M times (3.7 arguments on average) and 15.7 M small-memo allocations. Literals,
+  which OCaml allocates inline, changed nothing measurable.
+* **More GC space overhead.** 120 → 400 gives −4% check time for 2.3× the RSS.
+* **A larger minor heap.** Up to 16 M words, promotion falls only from 490 to 446 M
+  words and checking gets slower. `O4L_MEMPROF` explains why: about 95% of what is
+  promoted is expression nodes built by substitution and kept in the caches. These are
+  genuinely long-lived, not GC churn.
+* **Hash-cons lookups while checking** (6.8%). 73% of the 48.7 M lookups hit, keeping
+  results canonical, which session caching and pointer-equality checks rely on, so
+  they stay.
+
+What remains: substitution (14%), major GC (about 15%, dominated by marking the
+environment) and hash-cons lookups (7%). The next step would be fewer substitutions,
+not cheaper ones.
+
 ## Comparison with nanoda, con-leche and con-ron
 
 Not measured. Building them (Rust/Lean projects from GitHub) was blocked by the

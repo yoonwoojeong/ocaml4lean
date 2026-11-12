@@ -158,26 +158,26 @@ let check_ind_block env bi pos types ctors recs =
   match_lists "recursors" g.g_recs recs
 
 (* ---------------------------------------------------------------- blocks *)
-let check_block env bi pos (b : block) =
+let check_block ?session env bi pos (b : block) =
   match b with
   | Single ci ->
     (match ci.kind with
      | Axiom ->
-       let c = Tc.create ~safety:(if ci.unsafe then Unsafe else Safe) env bi pos in
+       let c = Tc.create ?session ~safety:(if ci.unsafe then Unsafe else Safe) env bi pos in
        check_type c ci
      | Thm { value; _ } ->
-       let c = Tc.create env bi pos in
+       let c = Tc.create ?session env bi pos in
        check_type c ci;
        if not (Tc.is_prop c ci.ty) then fail "theorem '%s' type is not a proposition" (Name.to_string ci.name);
        check_value c ci value
      | Opaq { value; _ } ->
-       let c = Tc.create ~safety:(if ci.unsafe then Unsafe else Safe) env bi pos in
+       let c = Tc.create ?session ~safety:(if ci.unsafe then Unsafe else Safe) env bi pos in
        check_type c ci;
        check_value c ci value
      | Defn { value; safety; all; _ } ->
        (match safety with
         | Safe ->
-          let c = Tc.create env bi pos in
+          let c = Tc.create ?session env bi pos in
           check_type c ci; check_value c ci value
         | _ ->
           (* unsafe or mutual partial: the header is checked first, then the
@@ -350,19 +350,39 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_ove
   let g = { budget_mb; base_heap; base_overhead; min_overhead = min base_overhead floor; max_jobs = max 1 jobs;
             allowed = Atomic.make (max 1 jobs); busy = Atomic.make false;
             next_sample = Atomic.make 0.0; overhead = (Gc.get ()).space_overhead; last_rss = 0; log } in
+  (* Domains claim contiguous chunks of blocks (as sokonanoda does), so related
+     declarations, which tend to be adjacent in the export, are checked by the
+     same domain and its session caches; within a domain blocks are still
+     visited in increasing order, so cached results only flow forward. *)
+  let chunk = match Sys.getenv_opt "O4L_CHUNK" with Some v -> max 1 (int_of_string v) | None -> 64 in
+  (* session caches: O4L_SESSION = entry budget (0 disables) *)
+  let session_budget = match Sys.getenv_opt "O4L_SESSION" with Some v -> int_of_string v | None -> 1_000_000 in
+  let use_session = session_budget > 0 in
   let worker w () =
+    let cur = ref 0 and stop = ref 0 in
+    let session = ref (Tc.new_session ()) in
     let rec loop () =
       if governed then begin
         governor_sample g;
-        (* paused while the governor allows fewer domains (worker 0 never is) *)
-        while w >= Atomic.get g.allowed && Atomic.get next < nb do
+        (* paused, between chunks, while the governor allows fewer domains
+           (worker 0 never is) *)
+        while !cur >= !stop && w >= Atomic.get g.allowed && Atomic.get next < nb do
           Unix.sleepf 0.05; governor_sample g
         done
       end;
-      let i = Atomic.fetch_and_add next 1 in
+      if !cur >= !stop then begin
+        (* session reset point: between chunks, once over budget *)
+        if Tc.session_entries !session > session_budget then begin
+          session := Tc.new_session (); reset_scratch ()
+        end;
+        let s = Atomic.fetch_and_add next chunk in
+        cur := s; stop := min nb (s + chunk)
+      end;
+      let i = !cur in
+      incr cur;
       if i < nb then begin
         let t0 = if timing then Unix.gettimeofday () else 0.0 in
-        (try check_block env bi i env.blocks.(i) with
+        (try check_block ?session:(if use_session then Some !session else None) env bi i env.blocks.(i) with
          | Kernel_error m -> errs.(i) <- Some m
          | e ->
            (* not a verdict about the input: a resource limit or a bug *)
@@ -373,7 +393,7 @@ let run ?(jobs = 1) ?(on_error = fun _ _ -> ()) ?(budget_mb = max_int) ?(min_ove
            errs.(i) <- Some ("internal error: " ^ m));
         if timing then times.(i) <- Unix.gettimeofday () -. t0;
         (match errs.(i) with Some m -> on_error i m | None -> ());
-        reset_scratch ();
+        if not use_session then reset_scratch ();
         loop ()
       end in
     loop () in

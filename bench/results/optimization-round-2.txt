@@ -1,0 +1,24 @@
+# Optimization round 2 (techniques ported from sokonanoda / Pestka)
+# 4-vCPU VM, 15 GB, OCaml 5.4.0, Lean v4.35.0 exports. Times from --stats.
+# base = main 8715624; new = session caches + chunking + pair-hash fix + parser.
+
+workload        base parse  base check   new parse  new check
+init -j1            7.79 s     76.41 s      5.87 s    48.69 s
+init -j4            7.34 s     20.20 s      6.11 s    15.76 s
+std  -j4           12.20 s     48.96 s     10.08 s    26.14 s
+lean -j4           16.15 s     56.04 s     12.35 s    29.92 s
+
+peak RSS (KB, /usr/bin/time): init -j4 1419284, std -j4 1986204, lean -j4 2961952
+(base: 1447 MB, 1906 MB, 2961 MB)
+
+parse only, lean.ndjson (827 MB), 3 runs:
+  base       15.85 16.31 16.26 s
+  buffered   12.81 13.18 13.05 s   (chunked input, key table, touched-slot reset)
+  one-pass   12.17 12.40 12.57 s   (newline found by the scanner)
+
+Mathlib proxy (6.2 GB, 1,056,596 declarations, -j4), session build without parser change:
+  base  585 s total, peak 8.06 GB
+  new   436 s total (parse 176 s, check 261 s), peak 8.16 GB
+
+perf cases (-j1, wall, 3 runs): magma_list_pair_n7 base 3.29/2.88/3.37 new 3.10/3.24/3.06;
+  beta_ladder base 2.23/2.22/2.25 new 2.43/2.14/2.18; app_lam base 11.5/11.1 new 11.0/10.3
