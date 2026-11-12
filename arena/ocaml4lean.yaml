@@ -21,10 +21,10 @@ description: |
     does. Errors (unparsable input, running out of stack or memory) exit with
     code 3 and are never reported as a rejection.
 
-  The parsed environment takes about as much memory as the export file. A memory
-  governor watches the resident set and, above a budget (80% of the machine's
-  memory), lowers the GC's space overhead and lets fewer domains start new
-  declarations; this changes scheduling only, never what is checked.
+  The parsed environment takes about as much memory as the export file; the GC's
+  space overhead is set once after parsing from the live heap and the machine's
+  memory. Running out of memory is reported as an error (exit 3), never as a
+  verdict.
 
   Written by Claude (Anthropic), directed by yoonwoojeong.
 url: https://github.com/yoonwoojeong/ocaml4lean

@@ -13,7 +13,7 @@ usage: arena.py ARENA_DIR WORK_DIR [glob...]
 import glob, json, os, re, shutil, signal, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEAN_HOME = os.environ.get("LEAN_HOME", "/opt/lean/lean-4.35.0-linux")
+LEAN_HOME = os.environ.get("LEAN_HOME", "/opt/lean/lean-4.34.1-linux")
 LEAN = os.path.join(LEAN_HOME, "bin", "lean")
 CHECKER = os.environ.get("CHECKER", os.path.join(ROOT, "ocaml4lean"))  # built by ./build.sh
 JOBS = os.environ.get("JOBS", "1")

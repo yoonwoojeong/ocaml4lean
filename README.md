@@ -16,7 +16,7 @@ unit-like types, Nat/String literal extensions, `eagerReduce`).
   [lean-kernel-arena](https://arena.lean-lang.org) run here it meets every expected
   outcome and agrees with the official kernel wherever both could run (see
   [PERFORMANCE.md](PERFORMANCE.md#validation)).
-* **Small trusted core, no dependencies**: ~3 600 lines of OCaml using only the
+* **Small trusted core, no dependencies**: about 3,800 lines of OCaml using only the
   compiler distribution (its own small bignum module, `src/z.ml`, for `Nat`
   literals). No OCaml `Obj` magic except reading two fixed record fields (see
   `Expr.hash`).
@@ -24,9 +24,9 @@ unit-like types, Nat/String literal extensions, `eagerReduce`).
   time; declarations are checked in parallel on OCaml 5 domains, and with 4 domains it
   checks `Init` in 0.35× and `Std` in 0.46× of the official kernel's time.
 
-See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark results and analysis, and
-[docs/MEMORY.md](docs/MEMORY.md) for the memory engineering (diagnosis of the arena's
-Mathlib failure, measured optimization stages, governor, OxCaml evaluation).
+See [docs/DESIGN.md](docs/DESIGN.md) for the design (trusted base, rules, invariants,
+verification gates) and [PERFORMANCE.md](PERFORMANCE.md) for benchmark results.
+A second, independent checker used as a test oracle lives in [ref/](ref/README.md).
 
 ## Build
 
